@@ -1,0 +1,63 @@
+# z1-web / SearXNG — local metasearch backend for the z1 coding agent.
+#
+# Image pinned to an immutable tag + digest so the agent never silently starts
+# scraping against a changed upstream build.
+#   tag:    2026.11.15-2d500cb6b   (published 2026-11-15, checked on 2026-11-15)
+#   digest: sha256:932f69dca010db9880bddebb2171f05d8e1a25d04a59149ff65409993d680024
+# Bump with: docker compose pull && docker compose up -d  (see README "Maintenance").
+name: z1-web
+
+services:
+  searxng:
+    image: searxng/searxng:2026.11.15-2d500cb6b@sha256:932f69dca010db9880bddebb2171f05d8e1a25d04a59149ff65409993d680024
+    container_name: z1-searxng
+    restart: unless-stopped
+
+    # Loopback only. Never publish on 0.0.0.0: this instance has no limiter and
+    # no authentication, so anything reachable from the LAN would be abused.
+    ports:
+      - "127.0.0.1:8888:8080"
+
+    # The repo's ./searxng directory (this file's directory) is the container's
+    # /etc/searxng: it holds settings.yml and any file SearXNG generates.
+    volumes:
+      - ./:/etc/searxng
+
+    env_file:
+      - .env
+    environment:
+      # Belt and braces: compose interpolation makes a missing secret a hard
+      # failure instead of a container that boots with a placeholder key.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET is not set — run ./scripts/searx-up.sh or create searxng/.env}
+      SEARXNG_BASE_URL: "http://127.0.0.1:8888/"
+      SEARXNG_LIMITER: "false"
+      SEARXNG_PUBLIC_INSTANCE: "false"
+      # Do not chown the bind-mounted host directory (the image would take
+      # ownership of settings.yml/docker-compose.yml as uid 977).
+      FORCE_OWNERSHIP: "false"
+
+    # Hardening. The entrypoint no longer drops privileges (granian runs as the
+    # container's root inside a dropped-capability user namespace-less sandbox)
+    # and it only ever binds 8080, so it needs no Linux capabilities at all.
+    # Verified: container starts healthy and serves JSON with the set below.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    # Measured steady state is well under 200 MB; 1 GB is a generous ceiling
+    # that still protects the host from a runaway engine.
+    mem_limit: 1g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

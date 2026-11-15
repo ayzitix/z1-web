@@ -1,0 +1,75 @@
+{
+  "query": "streams",
+  "number_of_results": 0,
+  "results": [
+    {
+      "url": "https://nodejs.org/api/stream.html?utm_source=x&utm_medium=y#top",
+      "title": "Stream | Node.js Documentation",
+      "content": "A stream is an abstract interface for working with streaming data in Node.js.",
+      "engine": "bing",
+      "publishedDate": null
+    },
+    {
+      "url": "https://nodejs.org/api/stream.html#bottom",
+      "title": "Same page, different fragment",
+      "content": "duplicate",
+      "engine": "google"
+    },
+    {
+      "url": "https://NODEJS.ORG/api/stream.html/",
+      "title": "Same page, case + trailing slash",
+      "content": "duplicate",
+      "engine": "brave"
+    },
+    {
+      "url": "https://example.com/post/?b=2&a=1&fbclid=abc",
+      "title": "Example post",
+      "content": "First copy of the example post.",
+      "engine": "mojeek"
+    },
+    {
+      "url": "https://example.com/post?a=1&b=2&gclid=xyz",
+      "title": "Example post again",
+      "content": "Second copy, same query in another order.",
+      "engine": "bing"
+    },
+    {
+      "url": "/relative/path",
+      "title": "Relative URL",
+      "content": "must be dropped"
+    },
+    {
+      "url": "javascript:alert(1)",
+      "title": "Javascript URL",
+      "content": "must be dropped"
+    },
+    {
+      "url": "https://blog.nodejs.org/2026/01/02/release/",
+      "title": "Node.js blog: release",
+      "content": "Release notes.",
+      "engine": "mojeek",
+      "publishedDate": "2026-01-02T00:00:00"
+    },
+    {
+      "url": "https://www.example.com/",
+      "title": "www is a different host",
+      "content": "Kept: www. is never stripped."
+    },
+    {
+      "url": "https://evil.example/",
+      "title": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA😀😀",
+      "content": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS😀TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\u001b[31mred‮",
+      "engine": "brave"
+    }
+  ],
+  "answers": [],
+  "corrections": [],
+  "infoboxes": [],
+  "suggestions": [],
+  "unresponsive_engines": [
+    [
+      "google",
+      "Suspended: access denied"
+    ]
+  ]
+}

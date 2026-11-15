@@ -1,0 +1,100 @@
+# SearXNG settings for the z1 coding agent (local, single-user, loopback only).
+# Docs: https://docs.searxng.org/admin/settings/
+use_default_settings: true
+
+general:
+  instance_name: "z1-searxng"
+  # No telemetry, no open metrics endpoint.
+  open_metrics: ""
+  enable_metrics: false
+  # Required by the wikipedia / wikidata / openstreetmap engines: without it
+  # they refuse to register ("wikipedia engine requires general.contact_url").
+  contact_url: "mailto:z1-agent@localhost"
+
+server:
+  # The real secret comes from the environment: SEARXNG_SECRET (see .env.example).
+  # SearXNG lets SEARXNG_SECRET override this value, so this placeholder is never
+  # used in practice; it only satisfies the schema so a missing env is obvious.
+  secret_key: "overridden-by-SEARXNG_SECRET"
+  base_url: "http://127.0.0.1:8888/"
+  # Loopback-only, single user -> no bot detection / rate limiting.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  # 0 = no filtering. This is a private, single-user instance used by an agent:
+  # an upstream "safe search" filter silently drops legitimate technical results.
+  safe_search: 0
+  # REQUIRED: the default is ["html"] only; without "json" the API answers 403.
+  formats:
+    - html
+    - json
+
+outgoing:
+  # Keep the agent's overall latency bounded: 4s per upstream request, 10s hard cap.
+  request_timeout: 4.0
+  max_request_timeout: 10.0
+  # Ask upstreams for compact HTML, we only need titles/urls/snippets.
+  pool_connections: 100
+  pool_maxsize: 20
+
+# ---------------------------------------------------------------------------
+# Engines
+# ---------------------------------------------------------------------------
+# In this SearXNG version `google` and `bing` ship *disabled* by default, so they
+# are explicitly re-enabled here. `brave`, `mojeek`, `wikipedia` and `github` are
+# enabled upstream already; they are listed for clarity (overrides by name).
+engines:
+  - name: google
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: brave
+    disabled: false
+  # Upstream ships `mojeek` as `inactive: true` (it now serves a proof-of-work
+  # challenge). Reactivated here only because it was requested; if it stops
+  # returning results, set `inactive: true` back.
+  - name: mojeek
+    disabled: false
+    inactive: false
+  - name: wikipedia
+    disabled: false
+    # Upstream ships display_type ["infobox"] only, so the JSON API would return
+    # an empty `results` array and put the article in `infoboxes`. "list" makes
+    # it a normal result the agent can read without understanding infoboxes.
+    display_type:
+      - infobox
+      - list
+  - name: github
+    disabled: false
+
+# ---------------------------------------------------------------------------
+# Engines that CAPTCHA / block on a residential IP
+# ---------------------------------------------------------------------------
+# These providers aggressively challenge non-datacenter, non-browser clients.
+# On a home connection expect `SearxEngineCaptcha` / `SearxEngineAccessDenied`
+# in `docker compose logs` and zero results from them:
+#
+#   google      - serves a JS/consent interstitial or "unusual traffic" page
+#                 intermittently; usually works for a while, then bans for hours
+#   bing        - returns a redirect to /copilotsearch or an empty result page
+#   brave       - Cloudflare challenge (cf_SearxEngineCaptcha, 15-day suspension)
+#   qwant       - 429 / empty JSON payload for non-browser clients
+#   startpage   - hard blocks scrapers, answers 403
+#   yandex      - CAPTCHA on nearly every automated request
+#   duckduckgo  - occasional anomaly page (anomaly.js) -> no results
+#
+# To drop a noisy engine, add it to the list below with `disabled: true`
+# (or delete the enabling entry above):
+#
+#   engines:
+#     - name: brave
+#       disabled: true
+#     - name: startpage
+#       disabled: true
+#
+# Note: a suspended engine stays suspended for the period configured in
+# search.suspended_times (default: 86400s for CAPTCHA, 1296000s for Cloudflare).
+# Restarting the container clears the suspension.

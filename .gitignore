@@ -1,0 +1,21 @@
+# --- secrets: never commit ---
+.env
+searxng/.env
+*.secret
+secrets/
+.env.local
+
+# generated runtime files from the searxng container
+searxng/*.log
+searxng/log/
+searxng/uwsgi.ini
+searxng/limiter.toml
+searxng/cache/
+searxng/data/
+
+# editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+node_modules/

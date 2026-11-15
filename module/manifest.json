@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "com.z1.web",
+  "version": "0.1.0",
+  "title": "z1 web",
+  "description": "Web search through a local SearXNG instance for z1 workers",
+  "author": "z1",
+  "license": "MIT",
+  "engines": {
+    "z1": ">=0.1.0"
+  },
+  "entry": "index.js",
+  "nodes": [],
+  "services": [
+    {
+      "id": "tools",
+      "kind": "tools",
+      "mode": "worker"
+    }
+  ],
+  "capabilities": {
+    "net": {
+      "hosts": ["*", "127.0.0.1", "[::1]"]
+    }
+  },
+  "limits": {
+    "timeoutMs": 60000
+  }
+}
