@@ -19,14 +19,28 @@
  *   markup this module generated. A source `<div class=x>` can never appear in
  *   the answer, and an entity-authored `&lt;div&gt;` is data, not a tag.
  *
- * Region selection is deliberate: `<main>` first, then `<article>`, then
- * `<body>`. Navigation, headers, footers, asides, forms and scripts are dropped
- * wherever they appear, so a docs page yields its prose and not its chrome.
+ * Region selection is deliberate: `[role=main]` first, then `<main>`, then
+ * `<article>`, then a handful of known ids/classes, then `<body>`. Navigation,
+ * headers, footers, asides, forms and scripts are dropped wherever they appear,
+ * so a docs page yields its prose and not its chrome. A page whose *whole*
+ * body sits in a chrome-looking container (`class="menu"`) is re-rendered with
+ * the filter off rather than reported as empty.
  *
  * @module z1-web/html
  */
 
-import { sanitise } from './format.js'
+import { clip, oneLine, sanitise, TITLE_MAX } from './format.js'
+
+/**
+ * How deep the tree may be, and how deep every walk over it may go. A real
+ * document is a few dozen elements deep; a hostile one can be 60 000 nested
+ * `<div>`s or 5 000 unclosed `<b>`s, which turns a careless recursive walker
+ * into `RangeError: Maximum call stack size exceeded` out of a tool. Past this
+ * budget the markup stops being structure: the element is not created, so its
+ * text joins the deepest element that is inside the budget, and every walker
+ * additionally treats a node at the limit as a leaf.
+ */
+export const MAX_DEPTH = 512
 
 /** Elements that never have children in the source. */
 const VOID = new Set([
@@ -211,7 +225,7 @@ function implyClose(stack, name) {
 }
 
 function buildTree(html) {
-  const root = { type: 'el', name: '#root', attrs: {}, children: [] }
+  const root = { type: 'el', name: '#root', attrs: {}, children: [], depth: 0 }
   const stack = [root]
   const top = () => stack[stack.length - 1]
   let i = 0
@@ -263,7 +277,25 @@ function buildTree(html) {
     if (tag.name === 'html' && stack.some((el) => el.name === 'html')) continue
     if (tag.name === 'body' && stack.some((el) => el.name === 'body')) continue
 
-    const element = { type: 'el', name: tag.name, attrs: tag.attrs, children: [] }
+    const depth = top().depth + 1
+    if (depth > MAX_DEPTH) {
+      // Past the budget this tag is not structure, only a label: do not create
+      // the element, so its text lands in the deepest element inside the
+      // budget. Raw-text elements still have to be consumed as text or their
+      // source (`<script>`) would leak into the answer as prose.
+      if (RAW_TEXT.has(tag.name)) {
+        const close = rawEnd(html, i, tag.name)
+        if (close === -1) {
+          i = html.length
+        } else {
+          const closing = readTag(html, close)
+          i = closing === null ? html.length : closing.end
+        }
+      }
+      continue
+    }
+
+    const element = { type: 'el', name: tag.name, attrs: tag.attrs, children: [], depth }
     top().children.push(element)
     if (VOID.has(tag.name)) continue
 
@@ -289,21 +321,42 @@ function buildTree(html) {
 // Tree queries
 // ---------------------------------------------------------------------------
 
+/** A node's own depth in the built tree; 0 when it was never recorded. */
+function depthOf(node) {
+  return typeof node.depth === 'number' ? node.depth : 0
+}
+
+/**
+ * The text directly inside a node, without descending. Used at the depth limit:
+ * it keeps the words a page buried a thousand tags down while guaranteeing the
+ * walk stops.
+ */
+function shallowText(node) {
+  if (node.type === 'text') return decodeEntities(node.value)
+  let text = ''
+  for (const child of node.children ?? []) {
+    if (child.type === 'text') text += decodeEntities(child.value)
+  }
+  return text
+}
+
 /** Depth-first search for the first element with `name`. */
-function findElement(node, name) {
+function findElement(node, name, depth = depthOf(node)) {
+  if (depth > MAX_DEPTH) return undefined
   for (const child of node.children ?? []) {
     if (child.type !== 'el') continue
     if (child.name === name) return child
-    const found = findElement(child, name)
+    const found = findElement(child, name, depth + 1)
     if (found !== undefined) return found
   }
   return undefined
 }
 
 /** All text under a node, whitespace preserved, entities decoded. */
-function rawText(node) {
+function rawText(node, depth = depthOf(node)) {
   if (node.type === 'text') return decodeEntities(node.value)
   if (node.type !== 'el') return ''
+  if (depth >= MAX_DEPTH) return shallowText(node)
   let text = ''
   for (const child of node.children) {
     if (child.type === 'el') {
@@ -313,7 +366,7 @@ function rawText(node) {
         continue
       }
     }
-    text += rawText(child)
+    text += rawText(child, depth + 1)
   }
   return text
 }
@@ -344,14 +397,20 @@ function roleTokens(node) {
  * answer. The chosen region and anything more specific than it (a `<pre>`, a
  * `<code>`, or a `role=main` subtree) is never dropped, so a page that wraps
  * its article in `class="doc-content nav-layout"` still keeps the article.
+ *
+ * `chrome = false` keeps only the unconditional drops (`<script>`, `<head>` …)
+ * and turns the heuristic off; `extractHtml` uses that to re-read a region the
+ * heuristic emptied, because a real page can put its whole body in
+ * `class="menu"`.
  */
-function isChrome(node, region) {
+function isChrome(node, region, chrome = true) {
   if (node.type !== 'el') return false
+  if (DROP.has(node.name)) return true
+  if (!chrome) return false
   if (node === region) return false
   const roles = roleTokens(node)
   if (roles.includes('main')) return false
   if (node.name === 'pre' || node.name === 'code') return false
-  if (DROP.has(node.name)) return true
   if (roles.some((role) => ROLE_CHROME.has(role))) return true
   for (const key of ['id', 'class']) {
     const value = node.attrs?.[key]
@@ -403,18 +462,32 @@ function codeLanguage(node) {
   return ''
 }
 
-function renderInlineChildren(node, ctx) {
+function renderInlineChildren(node, ctx, depth = depthOf(node)) {
   let text = ''
-  for (const child of node.children) text += renderInline(child, ctx)
+  for (const child of node.children) text += renderInline(child, ctx, depth + 1)
   return text
 }
 
-function renderInline(node, ctx) {
+/**
+ * Text that will sit inside `[...]` or be an image's alt: one line, no
+ * markdown link syntax (`](` would end the label and open a second link), no
+ * `javascript:` token. A page cannot smuggle a link, a footer or a second line
+ * into the answer through its own link or alt text.
+ */
+function inlineLabel(text) {
+  return oneLine(text)
+    .replace(/\]\s*\(/g, '] (')
+    .replace(/javascript\s*:/gi, '')
+    .trim()
+}
+
+function renderInline(node, ctx, depth = depthOf(node)) {
   if (node.type === 'text') return decodeEntities(node.value)
   if (node.type !== 'el') return ''
-  if (isChrome(node, ctx.region)) return ''
+  if (depth >= MAX_DEPTH) return collapse(shallowText(node))
+  if (isChrome(node, ctx.region, ctx.chrome !== false)) return ''
   if (node.name === 'br') return '\n'
-  if (node.name === 'img') return node.attrs.alt ? decodeEntities(node.attrs.alt) : ''
+  if (node.name === 'img') return node.attrs.alt ? inlineLabel(decodeEntities(node.attrs.alt)) : ''
   if (node.name === 'code') {
     const inner = collapse(rawText(node))
     if (inner === '') return ''
@@ -423,12 +496,12 @@ function renderInline(node, ctx) {
     return `${fence}${pad}${inner}${pad}${fence}`
   }
   if (node.name === 'a') {
-    const text = collapse(renderInlineChildren(node, ctx))
+    const text = inlineLabel(renderInlineChildren(node, ctx, depth))
     if (text === '') return ''
     const href = absoluteUrl(node.attrs.href, ctx.base)
     return href === undefined ? text : `[${text}](${href})`
   }
-  return renderInlineChildren(node, ctx)
+  return renderInlineChildren(node, ctx, depth)
 }
 
 // ---------------------------------------------------------------------------
@@ -442,9 +515,10 @@ function renderInline(node, ctx) {
  */
 const PRE_CHROME = /(?:^|\s)(?:toolbar|code-toolbar|highlight-toolbar|copy|copy-button|line-numbers|linenodiv|filename)(?:\s|$)/i
 
-function preText(node) {
+function preText(node, depth = depthOf(node)) {
   if (node.type === 'text') return decodeEntities(node.value)
   if (node.type !== 'el') return ''
+  if (depth >= MAX_DEPTH) return shallowText(node)
   let text = ''
   for (const child of node.children) {
     if (child.type === 'el') {
@@ -456,7 +530,7 @@ function preText(node) {
       const className = typeof child.attrs?.class === 'string' ? child.attrs.class : ''
       if (PRE_CHROME.test(className) || child.attrs?.role === 'toolbar') continue
     }
-    text += preText(child)
+    text += preText(child, depth + 1)
   }
   return text
 }
@@ -514,37 +588,40 @@ function renderList(node, ctx, depth = 0) {
  * GitHub issue layout, where the comment body lives in a `<td>` — and turning
  * it into pipe rows would flatten every paragraph and lose every code fence.
  */
-function containsBlock(node) {
+function containsBlock(node, depth = depthOf(node)) {
+  if (depth >= MAX_DEPTH) return false
   for (const child of node.children) {
     if (child.type !== 'el') continue
     if (child.name === 'p' || child.name === 'pre' || child.name === 'ul' || child.name === 'ol' ||
       child.name === 'blockquote' || child.name === 'table' || /^h[1-6]$/.test(child.name)) {
       return true
     }
-    if (containsBlock(child)) return true
+    if (containsBlock(child, depth + 1)) return true
   }
   return false
 }
 
-function isLayoutTable(node) {
+function isLayoutTable(node, depth = depthOf(node)) {
+  if (depth >= MAX_DEPTH) return false
   for (const child of node.children) {
     if (child.type !== 'el') continue
     if (child.name === 'tr') {
       for (const cell of child.children) {
         if (cell.type === 'el' && (cell.name === 'td' || cell.name === 'th') && containsBlock(cell)) return true
       }
-    } else if (child.name !== 'table' && isLayoutTable(child)) {
+    } else if (child.name !== 'table' && isLayoutTable(child, depth + 1)) {
       return true
     }
   }
   return false
 }
 
-function renderTable(node, ctx) {
+function renderTable(node, ctx, depth = depthOf(node)) {
   const rows = []
   let header = false
 
-  const walk = (element) => {
+  const walk = (element, at) => {
+    if (at >= MAX_DEPTH) return
     for (const child of element.children) {
       if (child.type !== 'el') continue
       if (child.name === 'tr') {
@@ -558,12 +635,12 @@ function renderTable(node, ctx) {
           rows.push(`| ${values.map(() => '---').join(' | ')} |`)
         }
       } else if (child.name !== 'table') {
-        walk(child)
+        walk(child, at + 1)
       }
     }
   }
 
-  walk(node)
+  walk(node, depth)
   return rows.join('\n')
 }
 
@@ -576,12 +653,19 @@ function quoteBlock(text) {
 }
 
 /** Render a node's children into blocks, accumulating inline text as one block. */
-function renderBlocks(node, ctx, out) {
+function renderBlocks(node, ctx, out, depth = depthOf(node)) {
   let buffer = ''
   const flush = () => {
     const text = collapse(buffer)
     if (text !== '') out.push(text)
     buffer = ''
+  }
+
+  if (depth >= MAX_DEPTH) {
+    // The depth budget is spent: keep the words, not the structure.
+    const text = collapse(shallowText(node))
+    if (text !== '') out.push(text)
+    return
   }
 
   for (const child of node.children) {
@@ -590,12 +674,12 @@ function renderBlocks(node, ctx, out) {
       continue
     }
     if (child.type !== 'el') continue
-    if (isChrome(child, ctx.region)) continue
+    if (isChrome(child, ctx.region, ctx.chrome !== false)) continue
 
     const heading = /^h([1-6])$/.exec(child.name)
     if (heading !== null) {
       flush()
-      const text = collapse(renderInlineChildren(child, ctx))
+      const text = collapse(renderInlineChildren(child, ctx, depth + 1))
       if (text !== '') out.push(`${'#'.repeat(Number(heading[1]))} ${text}`)
       continue
     }
@@ -604,7 +688,7 @@ function renderBlocks(node, ctx, out) {
       case 'p':
         flush()
         {
-          const text = collapse(renderInlineChildren(child, ctx))
+          const text = collapse(renderInlineChildren(child, ctx, depth + 1))
           if (text !== '') out.push(text)
         }
         continue
@@ -628,7 +712,7 @@ function renderBlocks(node, ctx, out) {
         flush()
         {
           const inner = []
-          renderBlocks(child, ctx, inner)
+          renderBlocks(child, ctx, inner, depth + 1)
           if (inner.length > 0) out.push(quoteBlock(inner.join('\n\n')))
         }
         continue
@@ -636,7 +720,7 @@ function renderBlocks(node, ctx, out) {
         flush()
         if (isLayoutTable(child)) {
           // Layout, not data: keep the blocks inside its cells.
-          renderBlocks(child, ctx, out)
+          renderBlocks(child, ctx, out, depth + 1)
         } else {
           const table = renderTable(child, ctx)
           if (table !== '') out.push(table)
@@ -668,7 +752,7 @@ function renderBlocks(node, ctx, out) {
       case 'q':
       case 'time':
       case 'label':
-        buffer += renderInline(child, ctx)
+        buffer += renderInline(child, ctx, depth + 1)
         continue
       default:
         break
@@ -680,7 +764,7 @@ function renderBlocks(node, ctx, out) {
       // flattening it as inline text would destroy every paragraph and fence
       // inside it.
       const inner = []
-      renderBlocks(child, ctx, inner)
+      renderBlocks(child, ctx, inner, depth + 1)
       if (inner.length > 0) {
         flush()
         out.push(...inner)
@@ -688,7 +772,7 @@ function renderBlocks(node, ctx, out) {
       continue
     }
 
-    buffer += renderInline(child, ctx)
+    buffer += renderInline(child, ctx, depth + 1)
   }
 
   flush()
@@ -698,59 +782,80 @@ function renderBlocks(node, ctx, out) {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/** `<base href>` resolved against the response URL, else the response URL. */
+/**
+ * `<base href>` resolved against the response URL, else the response URL.
+ *
+ * Only a **same-origin** base is honoured. A page can otherwise point every
+ * relative link at `http://169.254.169.254/latest/` and the answer would render
+ * `[click](http://169.254.169.254/latest/meta-data/)` — a metadata endpoint the
+ * model might then be tempted to fetch. Ignoring the cross-origin base leaves
+ * the links relative to the page that was actually read.
+ */
 function pageBase(root, baseUrl) {
   const base = findElement(root, 'base')
   if (base !== undefined && typeof base.attrs.href === 'string') {
     try {
       const resolved = new URL(base.attrs.href.trim(), baseUrl)
-      if (resolved.protocol === 'http:' || resolved.protocol === 'https:') return resolved.toString()
+      const page = new URL(baseUrl)
+      const sameOrigin = resolved.origin === page.origin
+      if (sameOrigin && (resolved.protocol === 'http:' || resolved.protocol === 'https:')) {
+        return resolved.toString()
+      }
     } catch {
-      // A broken base href is ignored; relative links then use the page URL.
+      // A broken base href (or an unparseable page URL) is ignored; relative
+      // links then use the response URL.
     }
   }
   return baseUrl
 }
 
+/**
+ * The page title, safe to put on the answer's first line: one line, no control
+ * characters, at most `TITLE_MAX` characters. A newline in `<title>` followed
+ * by a parenthesised string used to render a second line that looked exactly
+ * like the tool's own footer.
+ */
 function documentTitle(root) {
   const title = findElement(root, 'title')
   if (title !== undefined) {
-    const text = collapse(rawText(title))
+    const text = clip(oneLine(rawText(title)), TITLE_MAX)
     if (text !== '') return text
   }
   const h1 = findElement(root, 'h1')
   if (h1 !== undefined) {
-    const text = collapse(renderInlineChildren(h1, { base: undefined }))
+    const text = clip(oneLine(renderInlineChildren(h1, { base: undefined })), TITLE_MAX)
     if (text !== '') return text
   }
   return ''
 }
 
 /** Depth-first search for the first element matching `predicate`. */
-function findWhere(node, predicate) {
+function findWhere(node, predicate, depth = depthOf(node)) {
+  if (depth > MAX_DEPTH) return undefined
   for (const child of node.children ?? []) {
     if (child.type !== 'el') continue
     if (predicate(child)) return child
-    const found = findWhere(child, predicate)
+    const found = findWhere(child, predicate, depth + 1)
     if (found !== undefined) return found
   }
   return undefined
 }
 
 /** All text under a node with chrome subtrees left out; entities decoded. */
-function visibleText(node, region) {
+function visibleText(node, region, depth = depthOf(node), chrome = true) {
   if (node.type === 'text') return decodeEntities(node.value)
   if (node.type !== 'el') return ''
+  if (depth >= MAX_DEPTH) return shallowText(node)
   let text = ''
   for (const child of node.children) {
     if (child.type === 'el') {
-      if (isChrome(child, region)) continue
+      if (isChrome(child, region, chrome)) continue
       if (child.name === 'br') {
         text += '\n'
         continue
       }
     }
-    text += visibleText(child, region)
+    text += visibleText(child, region, depth + 1, chrome)
   }
   return text
 }
@@ -794,6 +899,20 @@ function pickRegion(root) {
 }
 
 /**
+ * Below this many characters an extracted region is suspicious: a real article
+ * is longer, so the answer was probably eaten by the chrome heuristic rather
+ * than by the page having no prose.
+ */
+const MIN_REGION_TEXT = 200
+
+/** Render a region into the answer text. */
+function renderRegion(region, ctx) {
+  const blocks = []
+  renderBlocks(region, ctx, blocks)
+  return sanitise(blocks.filter((block) => block.trim() !== '').join('\n\n')).trim()
+}
+
+/**
  * Extract readable text from an HTML document.
  *
  * @param {string} html
@@ -804,11 +923,36 @@ export function extractHtml(html, baseUrl) {
   if (typeof html !== 'string' || html === '') return { title: '', text: '' }
   const root = buildTree(html)
   const region = pickRegion(root)
-  const ctx = { base: pageBase(root, baseUrl), region }
+  const base = pageBase(root, baseUrl)
   const title = documentTitle(root)
-  const blocks = []
-  renderBlocks(region, ctx, blocks)
-  const text = sanitise(blocks.filter((block) => block.trim() !== '').join('\n\n')).trim()
+
+  let text = renderRegion(region, { base, region, chrome: true })
+
+  // `class="menu"` (or `-nav`) matches the chrome filter, and a page may put its
+  // whole body in such a container. Before reporting "no text", measure the
+  // region with the heuristic off: if there was substantial prose there, render
+  // it without the filter.
+  if (charCount(text) < MIN_REGION_TEXT) {
+    const unfiltered = collapse(visibleText(region, region, undefined, false))
+    // An empty answer is always wrong when anything visible remains, however
+    // short; otherwise a substantial hidden body is what justifies dropping the
+    // heuristic (a short page can legitimately be a heading and one sentence).
+    const worthRetrying =
+      charCount(unfiltered) >= MIN_REGION_TEXT ||
+      (charCount(text) === 0 && charCount(unfiltered) > 0)
+    if (worthRetrying) {
+      const loose = { base, region, chrome: false }
+      text = renderRegion(region, loose)
+      if (charCount(text) < MIN_REGION_TEXT) {
+        const body = findElement(root, 'body')
+        if (body !== undefined && body !== region) {
+          const bodyText = renderRegion(body, { base, region: body, chrome: false })
+          if (charCount(bodyText) > charCount(text)) text = bodyText
+        }
+      }
+    }
+  }
+
   return { title, text }
 }
 

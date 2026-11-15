@@ -1,6 +1,6 @@
 # com.z1.web
 
-The agent's own web tools for z1 workers. Version `0.3.1`, module id
+The agent's own web tools for z1 workers. Version `0.3.2`, module id
 `com.z1.web`, MIT.
 
 Five tools, one worker-mode `tools` service, no accounts and no API keys:
@@ -69,20 +69,29 @@ sent (including the qualifiers the tool added):
 ## web.fetch — reading a page
 
 `web.fetch` takes one URL and returns text a model can read, never markup. It
-parses the document, picks `<main>`, `<article>` or `<body>` (in that order),
-drops `nav`, `header`, `footer`, `aside`, `form`, `script`, `style`, `svg` and
-hidden content, and joins what is left as blocks separated by one blank line.
+parses the document, picks `[role=main]`, `<main>`, `<article>` or `<body>` (in
+that order), drops `nav`, `header`, `footer`, `aside`, `form`, `script`, `style`,
+`svg` and hidden content, and joins what is left as blocks separated by one
+blank line. If a region ends up (nearly) empty because the page's whole body sits
+in a chrome-looking container such as `class="menu"`, the region is rendered
+again with the chrome filter off instead of answering "(the page returned no
+text)". Parsing is depth-bounded at **512 levels**: a document 60 000 `<div>`s
+deep degrades to text at the limit instead of raising `RangeError`.
 
 | Type (from `content-type`) | What comes back |
 | --- | --- |
-| HTML / XHTML | Extracted blocks: `#`/`##` headings, paragraphs, `- ` lists, `> ` quotes, `\| a \| b \|` tables with a `\| --- \|` header separator, fenced code with its language, indentation and blank lines, and links as `[text](url)` resolved against `<base href>` or the final URL. A `<table>` whose cells hold paragraphs or code is page layout, so it renders as blocks instead of one flattened pipe row. A custom element (`<turbo-frame>`, `<react-app>`) is a container: its paragraphs and fences survive. |
+| HTML / XHTML | Extracted blocks: `#`/`##` headings, paragraphs, `- ` lists, `> ` quotes, `\| a \| b \|` tables with a `\| --- \|` header separator, fenced code with its language, indentation and blank lines, and links as `[text](url)` resolved against `<base href>` or the final URL. Only a **same-origin** `<base href>` is honoured: a page that points it at `169.254.169.254` or another host keeps every link on the URL that was actually fetched, and drops the base. A `<table>` whose cells hold paragraphs or code is page layout, so it renders as blocks instead of one flattened pipe row. A custom element (`<turbo-frame>`, `<react-app>`) is a container: its paragraphs and fences survive. |
 | `text/plain`, `text/markdown`, XML, JS | The body verbatim, minus a leading UTF-8 BOM. No extraction and no reflow, so ASCII tables and RFC indentation are intact. |
 | JSON | Pretty-printed with two spaces, so a one-line API answer is readable. |
 | PDF | Refused, with the size: `web.fetch: PDF is not supported yet (1 234 567 bytes) · fetch the HTML version or a text mirror`. |
 | Anything else | Refused with the type named: `web.fetch: image/png is not text (48 213 bytes) — https://…`. |
 
 A body with no `content-type` is sniffed — HTML when it starts with `<`, JSON
-when it parses, text otherwise — and the footer says `(sniffed)`.
+when it parses, text otherwise — and the footer says `(sniffed)`. A declared type
+that the body contradicts is sniffed too, because static hosts and mirrors
+mislable HTML as `text/plain` and some APIs answer JSON under `text/html`: the
+footer then reads `text/plain (sniffed html)` or `text/html (sniffed json)`, and
+the body is extracted as that type instead of dumped as source.
 
 **Output shape.** Line 1 is `title — url`, omitted when the page has neither a
 `<title>` nor a first `<h1>`; line 2 is the footer; a blank line; then the body:
@@ -111,10 +120,13 @@ call continues at exactly that character: fetching `maxChars:1000`, then
 `nodejs.org/api/stream.html`). An `offset` past the end is one notice naming the
 real length and `offset=1`, never an error.
 
-**Cache.** Answers are cached for 10 minutes, 50 entries, keyed by
-`(url, offset, maxChars)` — so paging one long page costs one request per slice,
-and a repeat of the same slice costs none. Only successful answers are cached;
-a hit prints `cached: yes` in the footer.
+**Cache.** One entry per **URL**, held for 10 minutes, and the whole cache is
+capped at **8 MiB** of stored text (UTF-16, so roughly four ~1 MiB pages), not at
+a fixed number of answers; the least recently used entry is evicted when the cap
+is reached. `offset` and `maxChars` are not part of the key — they slice the one
+stored page — so paging a long document costs one request in total and a repeat
+of any slice costs none. Only successful answers are cached; a hit prints
+`cached: yes` in the footer.
 
 **Untrusted.** A page body is attacker-controlled text from the open internet:
 control characters, bidi overrides and zero-width marks are stripped, HTML is
@@ -135,7 +147,7 @@ before a connection is made, and every redirect hop is re-checked.
 | `stack.search` | `api.stackexchange.com/2.3/search/advanced` | 300 requests/day per IP | 10 min, 50 entries |
 | `github.issues` | `api.github.com/search/issues` | 10 requests/minute per IP; 30 with `Z1_GITHUB_TOKEN` | 5 min, 50 entries |
 | `web.search` | local SearXNG | none (your own instance) | 10 min, 50 entries |
-| `web.fetch` | any public URL | no quota of its own | 10 min, 50 entries, keyed by url+offset+maxChars |
+| `web.fetch` | any public URL | no quota of its own | 10 min, one entry per URL, 8 MiB total |
 | `web.status` | `/healthz` | none | never cached |
 
 Only successful answers are cached — an empty list counts as an answer, an
@@ -163,7 +175,7 @@ never the repository root:
 
 ```bash
 z1 module propose ~/Projects/z1-web/module
-z1 module approve com.z1.web@0.3.1
+z1 module approve com.z1.web@0.3.2
 ```
 
 `propose` copies the whole `module/` directory (`manifest.json`, `index.js`,

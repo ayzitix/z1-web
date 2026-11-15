@@ -122,7 +122,11 @@ export function readParams(raw) {
   let accepted
   if (raw['accepted'] !== undefined && raw['accepted'] !== null) {
     if (typeof raw['accepted'] !== 'boolean') fail('accepted must be a boolean')
-    accepted = raw['accepted']
+    // The API has no "unaccepted" filter: only `accepted=true` is ever sent, so
+    // `false` describes no request. Normalise it to "unset" here so it also
+    // leaves the cache key alone — `accepted:false` and an omitted argument
+    // share one URL and one cached answer.
+    if (raw['accepted'] === true) accepted = true
   }
 
   let sort = 'relevance'

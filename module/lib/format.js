@@ -25,7 +25,8 @@
  * @module z1-web/format
  */
 
-const TITLE_MAX = 160
+/** Titles (search results, page `<title>`, issue titles) are clipped here. */
+export const TITLE_MAX = 160
 const SNIPPET_MAX = 300
 
 /** C0/C1 controls, bidi overrides and zero-width marks that can rewrite a line. */

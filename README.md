@@ -30,7 +30,7 @@ it is HTML, `search.formats` in the deployed settings lost its `json` entry.
 
 ```bash
 z1 module propose ~/Projects/z1-web/module         # the module only, not the repo root
-z1 module approve com.z1.web@0.3.1
+z1 module approve com.z1.web@0.3.2
 # then, in a z1 session:
 /tools on web.search
 ```
@@ -93,8 +93,14 @@ deployed settings.
   search teaser, not the page.
 - **8 results by default**, maximum 20, and **no re-ranking** — SearXNG's order
   is preserved verbatim.
-- **10-minute in-memory cache**, at most 50 entries, LRU. Only successful
-  answers are cached; a worker restart loses the cache.
+- **Caches are in memory, 10 minutes, and die with the worker.** `web.fetch` is
+  keyed by **URL**, not by arguments, and the whole cache holds at most **8 MiB**
+  of stored text (UTF-16, roughly four ~1 MiB pages), evicting the least recently
+  used entry; `offset` and `maxChars` slice the one stored page, so paging a long
+  document costs one request in total and a repeat of any slice costs none.
+  `web.search`, `stack.search` and `github.issues` keep their own
+  parameter-keyed caches of at most 50 answers. Only successful answers are
+  cached; a worker restart loses the cache.
 - **Results are untrusted text.** Titles and snippets are scraped upstream and
   rendered inert, but they are still attacker-controlled content. A `web.fetch`
   body is attacker-controlled too: HTML is reduced to inert blocks and the model
@@ -102,6 +108,23 @@ deployed settings.
 - **`web.fetch` refuses PDFs and binary bodies**, naming the type and size; there
   is no JavaScript execution and no login, so a page rendered client-side comes
   back nearly empty.
+- **Extraction is depth-bounded at 512 levels.** A document built deeper than
+  that (60 000 nested `<div>`s) collapses to text at the limit instead of raising
+  `RangeError`; the markup below the bound is flattened, not handled.
+- **Only a same-origin `<base href>` is honoured.** A page that points its base
+  at another host keeps every link on the URL that was actually fetched, and the
+  base is dropped.
+- **GitHub qualifiers typed into `query` are stripped.** `repo:`, `state:` and
+  `is:` in `github.issues`' `query` are removed, because the tool builds those
+  from its own arguments; use `repo`, `state` and `kind` instead.
+- **A `content-type` the body contradicts is sniffed and labelled.** Static hosts
+  serve HTML as `text/plain` and some APIs answer JSON under `text/html`, so the
+  footer reads `text/plain (sniffed html)` or `text/html (sniffed json)` and the
+  body is extracted as that type rather than dumped as source.
+- **A page whose content sits in a chrome-looking container still renders.** When
+  the chosen region ends up (nearly) empty because the whole body sits in a
+  `menu`/`sidebar`-classed container, it is rendered again with the chrome filter
+  off instead of answering "(the page returned no text)".
 
 ## Licence
 

@@ -19,18 +19,27 @@
  * 3. **Route on `content-type`**, not on the URL: HTML is extracted, plain text
  *    and markdown pass through, JSON is pretty-printed, PDF and media are
  *    refused with the type and size named, and a missing header is sniffed.
+ *    Two contradictions are resolved by looking at the body: a document that
+ *    starts `<!doctype html>`/`<html>` while claiming `text/plain` is extracted
+ *    (`(sniffed html)`), and a JSON body served as `text/html` is pretty-printed
+ *    (`(sniffed json)`). Plain text is otherwise passed through untouched.
  * 4. **Slice by character.** `offset` is 1-based and counts code points, never
  *    UTF-16 units, so a `maxChars` cut cannot split an emoji or a surrogate
  *    pair and `offset = previous end + 1` reconstructs the page exactly.
  *
- * Answers are cached for 10 minutes keyed by `(url, offset, maxChars)`, at most
- * 50 entries, successes only. A refusal, an error page or an empty body is
- * never cached, so a fixed login wall is retried rather than remembered.
+ * Answers are cached for 10 minutes **once per URL**, keyed by `url` only: the
+ * extracted text is the expensive part and `offset`/`maxChars` only slice it, so
+ * paging through a page costs one request and one copy, not one per slice. The
+ * cache is capped at 50 entries *and* at 8 MiB of text, evicting least-recently
+ * used entries until both hold. Successes only: a refusal, an error page or an
+ * empty body is never cached, so a fixed login wall is retried rather than
+ * remembered.
  *
  * @module z1-web/fetch
  */
 
 import { cacheKey as makeKey, createCache } from './cache.js'
+import { clip, oneLine, TITLE_MAX } from './format.js'
 import { charCount, extractHtml, slicePoints } from './html.js'
 import { header, headerInt, redactUrl, requestText, timeoutMs, VERSION, WebError } from './net.js'
 
@@ -45,9 +54,27 @@ const FIRST_OFFSET = 1
 
 const CACHE_TTL_MS = 10 * 60 * 1000
 const CACHE_MAX = 50
+/**
+ * Total size of cached page text. 50 entries alone would allow ~50 MiB of
+ * text (~100 MB of UTF-16 heap) if every page were a full 1 MiB body, so the
+ * cache is also capped by weight. A 1 MiB page weighs ~2 MiB here, so roughly
+ * four large pages (or hundreds of small ones) are kept.
+ */
+const CACHE_MAX_BYTES = 8 * 1024 * 1024
 
-/** Successful answers: key -> { at, value }. */
-const cache = createCache({ ttlMs: CACHE_TTL_MS, max: CACHE_MAX })
+/** A page's weight: UTF-16 bytes of its text, plus the record itself. */
+function weigh(page) {
+  const units = typeof page?.text === 'string' ? page.text.length : 0
+  return units * 2 + 1024
+}
+
+/** Successful pages: url key -> one entry holding the whole extracted text. */
+const cache = createCache({
+  ttlMs: CACHE_TTL_MS,
+  max: CACHE_MAX,
+  maxBytes: CACHE_MAX_BYTES,
+  bytesOf: weigh,
+})
 
 /** Test seam: empty the fetch cache. */
 export function clearCache() {
@@ -57,6 +84,11 @@ export function clearCache() {
 /** Test/diagnostic seam: current cache occupancy. */
 export function cacheSize() {
   return cache.size
+}
+
+/** Test/diagnostic seam: bytes (as `weigh` counts them) currently cached. */
+export function cacheBytes() {
+  return cache.bytes
 }
 
 function fail(message) {
@@ -160,6 +192,26 @@ function sniff(body) {
   return 'text'
 }
 
+/**
+ * A body that starts like an HTML document, whatever the header claims. Only
+ * `<!doctype html>` and `<html` count: a plain-text file that merely mentions
+ * `<p>` is still plain text.
+ */
+function looksLikeHtmlDocument(body) {
+  return /^\s*(?:<!doctype\s+html|<html[\s>])/i.test(body.slice(0, 512))
+}
+
+/** A body that is JSON despite being served as HTML — and parses, so it is real. */
+function looksLikeJson(body) {
+  if (!/^\s*[{[]/.test(body)) return false
+  try {
+    JSON.parse(body)
+    return true
+  } catch {
+    return false
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Request and errors
 // ---------------------------------------------------------------------------
@@ -222,11 +274,12 @@ function bodyBytes(response) {
 /**
  * One rendered answer: optional title line, footer, blank line, text, then the
  * continuation line when the page is longer than `maxChars`.
+ *
+ * `contentType` is already the label to print — it may carry `(sniffed …)`.
  */
-export function renderAnswer({ url, contentType, title, text, total, offset, maxChars, ms, cached, capped, sniffed }) {
-  const type = sniffed ? `${contentType || '(no content-type)'} (sniffed)` : contentType
+export function renderAnswer({ url, contentType, title, text, total, offset, maxChars, ms, cached, capped }) {
   const end = Math.min(total, offset - 1 + maxChars)
-  const parts = [type, `${groupDigits(total)} chars`, `showing ${offset}–${end}`, `${ms} ms`, `cached: ${cached ? 'yes' : 'no'}`]
+  const parts = [contentType, `${groupDigits(total)} chars`, `showing ${offset}–${end}`, `${ms} ms`, `cached: ${cached ? 'yes' : 'no'}`]
   if (capped) parts.push('body capped at 1 MiB')
 
   const shown = total === 0 ? '' : slicePoints(text, offset - 1, maxChars)
@@ -241,10 +294,9 @@ export function renderAnswer({ url, contentType, title, text, total, offset, max
   return lines.join('\n')
 }
 
-/** The "offset past the end" notice: informative, not an error, not cached. */
-function pastEndAnswer({ url, contentType, title, total, offset, ms, capped, sniffed }) {
-  const type = sniffed ? `${contentType} (sniffed)` : contentType
-  const parts = [type, `${groupDigits(total)} chars`, 'offset past end', `${ms} ms`, 'cached: no']
+/** The "offset past the end" notice: informative, not an error. */
+function pastEndAnswer({ url, contentType, title, total, offset, ms, cached, capped }) {
+  const parts = [contentType, `${groupDigits(total)} chars`, 'offset past end', `${ms} ms`, `cached: ${cached ? 'yes' : 'no'}`]
   if (capped) parts.push('body capped at 1 MiB')
   const notice = `(offset ${offset} is past the end; this page has ${groupDigits(total)} chars — call web.fetch with offset=1)`
   const lines = []
@@ -265,17 +317,24 @@ function pastEndAnswer({ url, contentType, title, total, offset, ms, capped, sni
  */
 export async function runFetch(ctx, raw) {
   const params = readParams(raw)
-  const key = makeKey(['fetch', params.url, params.offset, params.maxChars])
+  // One entry per URL: the extracted text is what costs a request and memory,
+  // and `offset`/`maxChars` only select a slice of it.
+  const key = makeKey(['fetch', params.url])
 
   const hit = cache.get(key)
-  if (hit !== undefined) return renderAnswer({ ...hit, cached: true })
+  if (hit !== undefined) {
+    return answerFor({ ...hit, offset: params.offset, maxChars: params.maxChars, cached: true })
+  }
 
   const page = await loadPage(ctx, params)
-
-  if (page.total < params.offset) return pastEndAnswer(page)
-
   cache.set(key, page)
-  return renderAnswer({ ...page, cached: false })
+  return answerFor({ ...page, offset: params.offset, maxChars: params.maxChars, cached: false })
+}
+
+/** A normal slice, or the "offset past the end" notice, from one loaded page. */
+function answerFor(page) {
+  if (page.total < page.offset) return pastEndAnswer(page)
+  return renderAnswer(page)
 }
 
 /** One request plus routing, extraction and the numbers the footer needs. */
@@ -307,10 +366,28 @@ async function loadPage(ctx, params) {
   // start with one) and it defeats the `^\s*<` HTML sniff below.
   const body = typeof response.body === 'string' ? response.body.replace(/^\uFEFF/, '') : response.body
 
-  const rawType = header(response.headers, 'content-type') ?? ''
-  const kind = routeContentType(rawType, body)
-  const sniffed = mimeOf(rawType) === ''
-  const contentType = sniffed ? sniffName(kind) : mimeOf(rawType)
+  const declared = mimeOf(header(response.headers, 'content-type'))
+  // No header at all: `routeContentType` guesses, and the footer says so.
+  const guessed = declared === ''
+  let kind = routeContentType(declared, body)
+  let contradict = ''
+
+  // A body that contradicts its `content-type`. `text/plain` is what static
+  // hosts and mirrors say about an HTML file, and dumping the source would be
+  // useless; JSON labelled `text/html` is usually an API behind a bad default.
+  if (declared === 'text/plain' && looksLikeHtmlDocument(body)) {
+    kind = 'html'
+    contradict = 'sniffed html'
+  } else if (declared === 'text/html' && looksLikeJson(body)) {
+    kind = 'json'
+    contradict = 'sniffed json'
+  }
+
+  const contentType = guessed
+    ? `${sniffName(kind)} (sniffed)`
+    : contradict === ''
+      ? declared
+      : `${declared} (${contradict})`
 
   if (kind === 'pdf') {
     throw new Error(
@@ -324,14 +401,24 @@ async function loadPage(ctx, params) {
 
   let title = ''
   let text
-  if (kind === 'html') {
-    const extracted = extractHtml(body, finalUrl)
-    title = extracted.title
-    text = extracted.text
-  } else if (kind === 'json') {
-    text = prettyJson(body)
-  } else {
-    text = body
+  try {
+    if (kind === 'html') {
+      const extracted = extractHtml(body, finalUrl)
+      // The extractor already flattens and clips the title; doing it again here
+      // is cheap and means no future title source can forge the footer line.
+      title = clip(oneLine(extracted.title), TITLE_MAX)
+      text = extracted.text
+    } else if (kind === 'json') {
+      text = prettyJson(body)
+    } else {
+      text = body
+    }
+  } catch (error) {
+    // A hostile page must never surface a stack trace out of a tool: one line,
+    // always, with a way forward.
+    throw new Error(
+      `web.fetch: could not extract this page (${reason(error)}) — try the raw text or another URL`,
+    )
   }
 
   const total = charCount(text)
@@ -343,12 +430,16 @@ async function loadPage(ctx, params) {
     title,
     text,
     total,
-    offset: params.offset,
-    maxChars: params.maxChars,
     ms: response.ms,
     capped: response.truncated === true,
-    sniffed,
   }
+}
+
+/** One clipped line of an unexpected error, for a tool-facing message. */
+function reason(error) {
+  const message = error instanceof Error ? error.message : String(error)
+  const text = clip(oneLine(message), 160)
+  return text === '' ? 'unknown error' : text
 }
 
 /** The label shown in the footer for a sniffed body. */

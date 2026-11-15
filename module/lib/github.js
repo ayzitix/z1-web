@@ -15,6 +15,13 @@
  * the request — a 422 costs one of the ten calls. GitHub caps a query at five
  * operators, so the tool never adds more than three.
  *
+ * The qualifiers this tool owns — `repo:`, `state:`, `is:`, `user:`, `org:` and
+ * `label:` — are **removed from the model's `query`** before the request. Left
+ * in, they would arrive after ours (`repo:a/b boom repo:evil/x state:closed`)
+ * and a repeated qualifier either widens the search or earns a 422. Stripping
+ * is silent and documented: the arguments `repo`/`state`/`kind` are the way to
+ * express those filters, so the words that remain are the user's keywords.
+ *
  * `sort` is omitted for `relevance`: GitHub documents `created`, `updated` and
  * `comments` and treats anything else as best match, so sending the literal
  * string would be noise in the URL and a validation risk if GitHub tightens
@@ -40,6 +47,13 @@ const MAX_LIMIT = 20
 /** GitHub rejects `q` longer than this. */
 const MAX_QUERY_LENGTH = 256
 const MAX_INPUT_QUERY = 500
+
+/**
+ * A qualifier the tool owns, as it can appear in free text: at the start, after
+ * whitespace or an opening bracket, optionally negated, with a bare or quoted
+ * value. `repo:rust-lang/rust` and `state:"closed"` both go; so does `-is:pr`.
+ */
+const OWNED_QUALIFIER = /(?:^|[\s(])[-+]?(?:repo|state|is|user|org|label):(?:"[^"]*"|'[^']*'|\S+)/gi
 
 const STATES = new Set(['open', 'closed', 'all'])
 const KINDS = new Set(['issue', 'pr', 'any'])
@@ -76,9 +90,12 @@ export function readParams(raw) {
   const rawQuery = raw['query']
   if (rawQuery === undefined || rawQuery === null) fail('query is required')
   if (typeof rawQuery !== 'string') fail('query must be a non-empty string')
-  const query = rawQuery.trim()
-  if (query === '') fail('query must be a non-empty string')
-  if (query.length > MAX_INPUT_QUERY) fail(`query is longer than ${MAX_INPUT_QUERY} characters; shorten it`)
+  if (rawQuery.trim() === '') fail('query must be a non-empty string')
+  if (rawQuery.length > MAX_INPUT_QUERY) fail(`query is longer than ${MAX_INPUT_QUERY} characters; shorten it`)
+  // The tool owns repo:/state:/is:/user:/org:/label:; a copy typed into the
+  // words would be appended after ours and could widen or break the search.
+  const query = stripQualifiers(rawQuery)
+  if (query === '') fail('query must contain keywords, not only repo:/state:/is: qualifiers')
 
   let repo
   if (raw['repo'] !== undefined && raw['repo'] !== null) {
@@ -119,11 +136,21 @@ export function readParams(raw) {
   return { query, repo, state, kind, sort, limit, q }
 }
 
+/**
+ * Drop the qualifiers this tool controls from the model's words and collapse
+ * what is left to one line. A qualifier that is the whole query leaves nothing,
+ * which `readParams` reports rather than sending `state:open is:issue` alone.
+ */
+export function stripQualifiers(query) {
+  return oneLine(query.replace(OWNED_QUALIFIER, ' '))
+}
+
 /** GitHub's `q`: repo first, then the user's words, then state and kind. */
 export function buildQuery({ query, repo, state, kind }) {
   const parts = []
   if (repo !== undefined) parts.push(`repo:${repo}`)
-  parts.push(oneLine(query))
+  const words = stripQualifiers(query)
+  if (words !== '') parts.push(words)
   if (state !== 'all') parts.push(`state:${state}`)
   if (kind === 'issue') parts.push('is:issue')
   if (kind === 'pr') parts.push('is:pr')
@@ -140,16 +167,27 @@ function readLimit(value) {
 }
 
 /**
+ * Which environment variable supplied the token: `Z1_GITHUB_TOKEN` or
+ * `GITHUB_TOKEN`, `undefined` when neither is set. The 401 message names the
+ * variable that was actually in effect instead of listing both.
+ */
+export function tokenSource() {
+  if ((process.env['Z1_GITHUB_TOKEN'] ?? '').trim() !== '') return 'Z1_GITHUB_TOKEN'
+  if ((process.env['GITHUB_TOKEN'] ?? '').trim() !== '') return 'GITHUB_TOKEN'
+  return undefined
+}
+
+/**
  * The token, or `undefined`. `Z1_GITHUB_TOKEN` wins because that is the only
  * name the host passes into a worker's environment; `GITHUB_TOKEN` stays a
  * fallback for local/native runs. Never include either value in a message or a
  * cache key.
  */
 export function token() {
-  const hosted = (process.env['Z1_GITHUB_TOKEN'] ?? '').trim()
-  if (hosted !== '') return hosted
-  const local = (process.env['GITHUB_TOKEN'] ?? '').trim()
-  return local === '' ? undefined : local
+  const name = tokenSource()
+  if (name === undefined) return undefined
+  const value = (process.env[name] ?? '').trim()
+  return value === '' ? undefined : value
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +235,9 @@ async function fetchIssues(ctx, params) {
   const reset = headerInt(response.headers, 'x-ratelimit-reset')
 
   if (response.status === 401) {
-    fail('GitHub rejected Z1_GITHUB_TOKEN/GITHUB_TOKEN (HTTP 401) · unset or replace it; anonymous search still works')
+    const sent = tokenSource()
+    if (sent === undefined) fail('GitHub answered HTTP 401 (no token was sent) · retry later')
+    fail(`GitHub rejected ${sent} (HTTP 401) · unset or replace it; anonymous search still works`)
   }
   if (response.status === 403) {
     if (remaining === 0) {

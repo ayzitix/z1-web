@@ -84,7 +84,7 @@ check('relative/javascript URLs dropped', !/relative|javascript:/.test(plain))
 check('www. is NOT stripped', plain.includes('https://www.example.com/'))
 check('SearXNG order preserved', plain.indexOf('nodejs.org/api/stream.html') < plain.indexOf('example.com/post'))
 check('request had Accept + User-Agent',
-  requests[0].headers.accept === 'application/json' && requests[0].headers['user-agent'] === 'z1-web/0.3.1')
+  requests[0].headers.accept === 'application/json' && requests[0].headers['user-agent'] === 'z1-web/0.3.2')
 check('request URL carries format=json and language=all',
   requests[0].url.includes('format=json') && requests[0].url.includes('language=all') && requests[0].url.includes('safesearch=0'))
 

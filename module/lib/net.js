@@ -29,7 +29,7 @@
  */
 
 /** Matches the manifest version; also every tool's User-Agent suffix. */
-export const VERSION = '0.3.1'
+export const VERSION = '0.3.2'
 
 export const DEFAULT_SEARX_URL = 'http://127.0.0.1:8888'
 export const DEFAULT_TIMEOUT_MS = 15_000
