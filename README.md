@@ -26,17 +26,49 @@ curl -sS 'http://127.0.0.1:8888/search?q=typescript&format=json' | head -c 200
 Expect HTTP 200 and a body starting `{"query": "typescript", "results": [`. If
 it is HTML, `search.formats` in the deployed settings lost its `json` entry.
 
-## Install
+## Repository and install
+
+This repository contains **only the module**. The search backend is not here:
+z1 installs a native SearXNG into `~/.local/share/z1/web/searxng` on first run.
+An install is therefore two steps — get the repo, then propose its `module/`:
 
 ```bash
-z1 module propose ~/Projects/z1-web/module         # the module only, not the repo root
+git clone https://github.com/ayzitix/z1-web ~/Projects/z1-web
+z1 module propose ~/Projects/z1-web/module
 z1 module approve com.z1.web@0.3.2
-# then, in a z1 session:
+```
+
+Then enable a tool in a z1 session:
+
+```text
 /tools on web.search
 ```
 
-There is no separate backend start step: the first `web.search` call, or the
-provisioning that precedes it, is what starts SearXNG.
+Propose `module/` only, not the repo root: `z1 module propose` copies the whole
+directory it is given, so the root would drag in the tests and this README.
+
+The module needs a `z1-cli` at or after the commit that provisions native
+SearXNG (`b64e42e`, *feat(web): provision and start a native SearXNG on
+launch*). That CLI installs SearXNG, writes the settings, generates the
+`SEARXNG_SECRET` privately and **starts the backend on launch** — there is no
+Docker and no separate backend start step. On an older CLI the module installs
+and `web.search` fails with a refused connection naming
+`http://127.0.0.1:8888`.
+
+### Grant to expect
+
+`z1 module approve` shows this grant before accepting it:
+
+```json
+{ "net": { "hosts": ["*", "127.0.0.1", "[::1]"] } }
+```
+
+- `*` is **public internet only** — a wildcard is not an SSRF grant. Loopback,
+  LAN, link-local and cloud-metadata targets stay denied unless the manifest
+  names that exact host.
+- `127.0.0.1` and `[::1]` are those explicit literals, and they exist solely so
+  the local SearXNG is reachable. There is no filesystem, process or LLM
+  capability in the manifest.
 
 ## Layout
 
