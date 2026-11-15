@@ -26,26 +26,27 @@
  * Caching: per process, keyed by the base URL plus every normalised parameter,
  * TTL 10 minutes, at most 50 entries, evicted oldest-first. Only successful
  * answers are cached (an empty list is an answer; an error is not), so a
- * container that comes up is not hidden by a cached failure. The footer says
+ * backend that just started is not hidden by a cached failure. The footer says
  * `cached` and repeats the original latency rather than pretending the hit was
  * instant.
  *
  * @module z1-web/search
  */
 
-import { clip, oneLine, renderEmpty, renderResults, renderStatus } from './format.js'
+import { cacheKey as makeKey, createCache } from './cache.js'
+import { clip, oneLine, renderEmpty, renderResults } from './format.js'
 import {
   header,
   redactUrl,
   requestText,
   searxBaseUrl,
-  searxBaseUrlIsOverride,
   timeoutMs,
+  VERSION,
   WebError,
 } from './net.js'
 
-/** Matches the manifest version; also the User-Agent suffix. */
-export const VERSION = '0.1.0'
+export { VERSION }
+export { runStatus } from './status.js'
 
 const CACHE_TTL_MS = 10 * 60 * 1000
 const CACHE_MAX = 50
@@ -59,7 +60,7 @@ const SITE_PATTERN = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*
 const TRACKING_PARAMS = new Set(['fbclid', 'gclid', 'ref'])
 
 /** Cache of successful searches: key -> { at, value }. */
-const cache = new Map()
+const cache = createCache({ ttlMs: CACHE_TTL_MS, max: CACHE_MAX })
 
 /** Test seam: empty the search cache. */
 export function clearCache() {
@@ -184,7 +185,7 @@ async function fetchJson(ctx, params) {
   const body = response.body
   if (looksLikeHtml(body, contentType)) {
     throw new Error(
-      `web.search: SearXNG returned HTML · set search.formats: [html, json] and restart the container${
+      `web.search: SearXNG returned HTML · set search.formats: [html, json] and restart SearXNG${
         response.status === 200 ? '' : ` (HTTP ${response.status})`
       }`,
     )
@@ -226,8 +227,8 @@ function describeError(error, base, timeout) {
   }
   if (kind === 'unreachable') {
     return new Error(
-      `web.search: SearXNG is not reachable at ${redactUrl(base)} · ` +
-        `start it with ~/Projects/z1-web/scripts/searx-up.sh (or set Z1_SEARX_URL)`,
+      `web.search: SearXNG is not running at ${redactUrl(base)} · ` +
+        `z1 starts it on launch; retry in a few seconds, or set Z1_SEARX_URL`,
     )
   }
   if (kind === 'denied') {
@@ -335,86 +336,23 @@ export function normaliseResults(raw, { count, site } = {}) {
 // Cache
 // ---------------------------------------------------------------------------
 
+/** The cache key: base URL plus every normalised parameter. */
 function cacheKey(params, base) {
-  const stable = [
-    `base=${base}`,
-    `query=${params.query}`,
-    `count=${params.count}`,
-    `site=${params.site ?? ''}`,
-    `language=${params.language}`,
-    `recency=${params.recency ?? ''}`,
-    `safe=${params.safe ? '1' : '0'}`,
-  ].join('\u0000')
-  return stable
-}
-
-function cacheGet(key) {
-  const hit = cache.get(key)
-  if (hit === undefined) return undefined
-  if (Date.now() - hit.at > CACHE_TTL_MS) {
-    cache.delete(key)
-    return undefined
-  }
-  // Refresh insertion order so eviction is least-recently-used.
-  cache.delete(key)
-  cache.set(key, hit)
-  return hit.value
-}
-
-function cacheSet(key, value) {
-  cache.delete(key)
-  cache.set(key, { at: Date.now(), value })
-  while (cache.size > CACHE_MAX) {
-    const oldest = cache.keys().next()
-    if (oldest.done === true) break
-    cache.delete(oldest.value)
-  }
+  return makeKey([
+    'searxng',
+    base,
+    params.query,
+    params.count,
+    params.site ?? '',
+    params.language,
+    params.recency ?? '',
+    params.safe ? '1' : '0',
+  ])
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
-
-/** Short deadline for a health probe: a status line must not hang a worker. */
-const STATUS_TIMEOUT_CAP_MS = 3000
-
-/**
- * `web.status`: ping `/healthz` and report two lines. Never throws — a status
- * tool that fails is useless, so every failure becomes the `unhealthy` word
- * plus a short reason.
- */
-export async function runStatus(ctx) {
-  const base = searxBaseUrl()
-  const url = redactUrl(base)
-  const override = searxBaseUrlIsOverride()
-  const envTimeoutRaw = (process.env['Z1_WEB_TIMEOUT_MS'] ?? '').trim()
-  const envTimeout = envTimeoutRaw === '' ? undefined : envTimeoutRaw
-  const fetchState = 'web.fetch: not implemented yet'
-
-  const probeTimeout = Math.min(timeoutMs(), STATUS_TIMEOUT_CAP_MS)
-  let state = 'healthy'
-  let detail
-
-  try {
-    const response = await requestText(ctx, `${base}/healthz`, {
-      headers: { accept: 'text/plain', 'user-agent': `z1-web/${VERSION}` },
-      timeout: probeTimeout,
-    })
-    if (response.status !== 200) {
-      state = 'unhealthy'
-      detail = `HTTP ${response.status}`
-    }
-  } catch (error) {
-    state = 'unhealthy'
-    const web = error instanceof WebError ? error : null
-    if (web?.kind === 'timeout') detail = `no answer within ${probeTimeout} ms`
-    else if (web?.kind === 'unreachable') detail = 'not reachable'
-    else if (web?.kind === 'denied') detail = 'host refused the request'
-    else detail = oneLine(error instanceof Error ? error.message : String(error))
-  }
-
-  return renderStatus({ url, state, detail, override, envTimeout, fetchState })
-}
 
 /** Run one search and return the model-facing text. Throws on failure. */
 export async function runSearch(ctx, raw) {
@@ -422,7 +360,7 @@ export async function runSearch(ctx, raw) {
   const base = searxBaseUrl()
   const key = cacheKey(params, base)
 
-  const cached = cacheGet(key)
+  const cached = cache.get(key)
   if (cached !== undefined) {
     return renderAnswer(params, { ...cached, cached: true })
   }
@@ -439,7 +377,7 @@ export async function runSearch(ctx, raw) {
     note: hasResults ? undefined : 'the JSON had no results key',
   }
 
-  cacheSet(key, value)
+  cache.set(key, value)
   return renderAnswer(params, { ...value, cached: false })
 }
 

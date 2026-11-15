@@ -1,4 +1,8 @@
 # SearXNG settings for the z1 coding agent (local, single-user, loopback only).
+#
+# TEMPLATE: this is the configuration the native SearXNG backend uses. z1
+# copies it into place and provisions the instance itself; edit it here and
+# re-run the provisioning, or edit the deployed copy directly.
 # Docs: https://docs.searxng.org/admin/settings/
 use_default_settings: true
 
@@ -12,9 +16,10 @@ general:
   contact_url: "mailto:z1-agent@localhost"
 
 server:
-  # The real secret comes from the environment: SEARXNG_SECRET (see .env.example).
-  # SearXNG lets SEARXNG_SECRET override this value, so this placeholder is never
-  # used in practice; it only satisfies the schema so a missing env is obvious.
+  # The real secret is supplied to the process as SEARXNG_SECRET by the z1
+  # provisioner, which generates and stores it privately. SearXNG lets that
+  # environment variable override this value, so this placeholder is never used
+  # in practice; it only satisfies the schema so a missing secret is obvious.
   secret_key: "overridden-by-SEARXNG_SECRET"
   base_url: "http://127.0.0.1:8888/"
   # Loopback-only, single user -> no bot detection / rate limiting.
@@ -75,7 +80,7 @@ engines:
 # ---------------------------------------------------------------------------
 # These providers aggressively challenge non-datacenter, non-browser clients.
 # On a home connection expect `SearxEngineCaptcha` / `SearxEngineAccessDenied`
-# in `docker compose logs` and zero results from them:
+# in the SearXNG log and zero results from them:
 #
 #   google      - serves a JS/consent interstitial or "unusual traffic" page
 #                 intermittently; usually works for a while, then bans for hours
@@ -97,4 +102,4 @@ engines:
 #
 # Note: a suspended engine stays suspended for the period configured in
 # search.suspended_times (default: 86400s for CAPTCHA, 1296000s for Cloudflare).
-# Restarting the container clears the suspension.
+# Restarting SearXNG clears the suspension.

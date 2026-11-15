@@ -1,8 +1,15 @@
-// Fully fake `ctx.net`: no container, no network. Fixtures only.
+// Fully fake `ctx.net`: no backend, no network. Fixtures only.
 // Asserts normalisation, clipping, dedupe, site filtering, cache and errors.
 import { readFileSync } from 'node:fs'
-import { services } from '/home/oleksii/Projects/z1-web/module/index.js'
-import { cacheSize, cleanUrl, clearCache } from '/home/oleksii/Projects/z1-web/module/lib/search.js'
+
+// The module's caches capture `Date.now` when they are created, so the fake
+// clock has to be installed before the import for a TTL assertion to mean
+// anything.
+const clock = { now: Date.now() }
+Date.now = () => clock.now
+
+const { services } = await import('/home/oleksii/Projects/z1-web/module/index.js')
+const { cacheSize, cleanUrl, clearCache } = await import('/home/oleksii/Projects/z1-web/module/lib/search.js')
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8'))
 const SEARCH = fixture('search')
@@ -32,7 +39,9 @@ const tool = () => services.tools(ctx)
 const call = (args) => tool().call('web.search', args)
 
 let failures = 0
+let checks = 0
 function check(label, condition, detail = '') {
+  checks += 1
   if (condition) {
     console.log(`ok   ${label}`)
   } else {
@@ -52,8 +61,9 @@ async function errorOf(fn) {
 
 // --- schema ----------------------------------------------------------------
 const schemas = tool().list()
-check('two tools are listed', schemas.length === 2)
-check('names are web.search / web.status', schemas.map((s) => s.name).join(',') === 'web.search,web.status')
+check('four tools are listed', schemas.length === 4)
+check('names are web.search / stack.search / github.issues / web.status',
+  schemas.map((s) => s.name).join(',') === 'web.search,stack.search,github.issues,web.status')
 check('search requires only query', JSON.stringify(schemas[0].parameters.required) === '["query"]')
 check('descriptions mention untrusted results', /untrusted/i.test(schemas[0].description))
 check('descriptions mention site: and recency', /site:/.test(schemas[0].description) && /recency/.test(schemas[0].description))
@@ -74,7 +84,7 @@ check('relative/javascript URLs dropped', !/relative|javascript:/.test(plain))
 check('www. is NOT stripped', plain.includes('https://www.example.com/'))
 check('SearXNG order preserved', plain.indexOf('nodejs.org/api/stream.html') < plain.indexOf('example.com/post'))
 check('request had Accept + User-Agent',
-  requests[0].headers.accept === 'application/json' && requests[0].headers['user-agent'] === 'z1-web/0.1.0')
+  requests[0].headers.accept === 'application/json' && requests[0].headers['user-agent'] === 'z1-web/0.2.0')
 check('request URL carries format=json and language=all',
   requests[0].url.includes('format=json') && requests[0].url.includes('language=all') && requests[0].url.includes('safesearch=0'))
 
@@ -154,11 +164,8 @@ const beforeEvict = requests.length
 await call({ query: 'capacity 0' })
 check('oldest entry was evicted (re-fetched)', requests.length === beforeEvict + 1)
 
-const realNow = Date.now
-const base = realNow()
-Date.now = () => base + 11 * 60 * 1000
+clock.now += 11 * 60 * 1000
 const afterTtl = await call({ query: 'capacity 0' })
-Date.now = realNow
 check('entries expire after 10 minutes', /· cached\)$/.test(afterTtl) === false, afterTtl.split('\n').at(-1))
 
 // --- errors ----------------------------------------------------------------
@@ -171,7 +178,7 @@ nextResponse = () => ({
 })
 const htmlError = await errorOf(() => call({ query: 'x' }))
 check('HTML 200 -> formats hint',
-  htmlError === 'web.search: SearXNG returned HTML · set search.formats: [html, json] and restart the container',
+  htmlError === 'web.search: SearXNG returned HTML · set search.formats: [html, json] and restart SearXNG',
   htmlError)
 
 nextResponse = () => ({ status: 403, headers: { 'content-type': 'text/html' }, body: '<html>forbidden</html>', truncated: false })
@@ -199,8 +206,8 @@ nextResponse = () => {
   throw error
 }
 const refused = await errorOf(() => call({ query: 'x' }))
-check('refused connection names the container command',
-  refused.startsWith('web.search: SearXNG is not reachable at http://127.0.0.1:8888 · start it with ~/Projects/z1-web/scripts/searx-up.sh'),
+check('refused connection names the backend provisioning path',
+  refused.startsWith('web.search: SearXNG is not running at http://127.0.0.1:8888 · z1 starts it on launch; retry in a few seconds, or set Z1_SEARX_URL'),
   refused)
 
 // Redaction of user:pass@ in every message that prints the URL.
@@ -239,26 +246,41 @@ check('rejects a non-object argument', (await errorOf(() => tool().call('web.sea
 check('rejects an unknown tool', (await errorOf(() => tool().call('web.fetch', {}))).includes('unknown tool'))
 
 // --- status ----------------------------------------------------------------
+delete process.env.Z1_SEARX_STATE
 process.env.Z1_SEARX_URL = 'http://127.0.0.1:8888'
 nextResponse = () => ({ status: 200, headers: { 'content-type': 'text/plain' }, body: 'OK', truncated: false })
 const healthy = await tool().call('web.status', {})
 check('status healthy line',
-  healthy.split('\n')[0] === 'searxng · http://127.0.0.1:8888 · healthy · default provider · fallbacks: none configured',
+  healthy.split('\n')[0] === 'searxng · http://127.0.0.1:8888 · healthy · 0 ms',
   healthy)
-check('status second line names the override and web.fetch',
-  healthy.split('\n')[1] === 'Z1_SEARX_URL=http://127.0.0.1:8888 (override) · web.fetch: not implemented yet',
+check('status second line names both keyless tools and the quotas',
+  healthy.split('\n')[1] ===
+    'stack.search · github.issues · keyless · available (Stack Exchange 300/day per IP · GitHub 10/min anonymous) Z1_SEARX_URL override',
   healthy)
 
 nextResponse = () => ({ status: 500, headers: {}, body: 'boom', truncated: false })
 const unhealthy = await tool().call('web.status', {})
-check('status reports a non-200 without throwing', unhealthy.includes('unhealthy · HTTP 500'), unhealthy)
+check('status reports a non-200 as down without throwing',
+  unhealthy.split('\n')[0] === 'searxng · http://127.0.0.1:8888 · down · z1 starts it on launch (first run installs ~120 MB)',
+  unhealthy)
+
+process.env.Z1_SEARX_STATE = `starting:${Date.now()}`
+const starting = await tool().call('web.status', {})
+check('status believes a starting hint from the host',
+  starting.split('\n')[0] ===
+    'searxng · http://127.0.0.1:8888 · starting · z1 is installing or starting it (~120 MB on first run); retry in a few seconds',
+  starting)
+process.env.Z1_SEARX_STATE = `starting:${Date.now() - 3 * 60 * 1000}`
+check('status ignores a stale starting hint',
+  (await tool().call('web.status', {})).split('\n')[0].includes(' · down · '))
+delete process.env.Z1_SEARX_STATE
 
 nextResponse = () => {
   throw new Error('fetch failed')
 }
 const dead = await tool().call('web.status', {})
-check('status never throws', dead.includes('unhealthy'), dead)
+check('status never throws', dead.includes(' · down · '), dead)
 delete process.env.Z1_SEARX_URL
 
-console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`} — ${50 + 1} checks`)
+console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`} — ${checks} checks`)
 process.exit(failures === 0 ? 0 : 1)

@@ -22,10 +22,13 @@
  * A refused connection or a DNS failure reaches a worker as a rejected
  * `ctx.net.request` (Node's `TypeError: fetch failed` with a `cause.code`), so
  * the classification below reads `err.cause` as well: the tool result should
- * say "start the container", never "fetch failed".
+ * say "start the backend", never "fetch failed".
  *
  * @module z1-web/net
  */
+
+/** Matches the manifest version; also every tool's User-Agent suffix. */
+export const VERSION = '0.2.0'
 
 export const DEFAULT_SEARX_URL = 'http://127.0.0.1:8888'
 export const DEFAULT_TIMEOUT_MS = 15_000
@@ -204,3 +207,53 @@ export function header(headers, name) {
   }
   return undefined
 }
+
+/**
+ * A header as an integer, or `undefined` when absent or not a number. Quota
+ * headers are the reason: they arrive as strings and a proxy may omit them.
+ */
+export function headerInt(headers, name) {
+  const raw = header(headers, name)
+  if (raw === undefined || raw.trim() === '') return undefined
+  const value = Number(raw)
+  return Number.isFinite(value) ? Math.trunc(value) : undefined
+}
+
+/**
+ * GET a URL and try to parse it as JSON, without deciding what a non-2xx
+ * answer means. Public APIs disagree (`400` = unknown site for Stack
+ * Exchange, `422` = bad query for GitHub), so the status, headers and raw body
+ * come back untouched and the caller classifies them.
+ *
+ * @returns {Promise<{ status: number, headers: Record<string, string>, body: string, data: unknown, json: boolean, truncated: boolean, ms: number }>}
+ */
+export async function requestJson(ctx, url, options = {}) {
+  const response = await requestText(ctx, url, options)
+  let data
+  let json = false
+  try {
+    data = JSON.parse(response.body)
+    json = true
+  } catch {
+    data = undefined
+  }
+  return { ...response, data, json }
+}
+
+/** The first line of a JSON error body, clipped, for an actionable message. */
+export function bodyMessage(body, max = 200) {
+  if (typeof body !== 'string' || body.trim() === '') return ''
+  try {
+    const parsed = JSON.parse(body)
+    if (parsed !== null && typeof parsed === 'object') {
+      const message = parsed['message'] ?? parsed['error_message']
+      if (typeof message === 'string' && message.trim() !== '') {
+        return message.replace(/\s+/g, ' ').trim().slice(0, max)
+      }
+    }
+  } catch {
+    // Not JSON: fall through to the raw excerpt.
+  }
+  return body.replace(/\s+/g, ' ').trim().slice(0, max)
+}
+
