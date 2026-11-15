@@ -1,8 +1,9 @@
 /**
  * Environment, HTTP and error plumbing shared by the web tools.
  *
- * Everything a tool needs that is not SearXNG-specific lives here, so a later
- * `web.fetch` can reuse it without touching `search.js`:
+ * Everything a tool needs that is not SearXNG-specific lives here, so
+ * `web.search`, `web.fetch` and the two API searches share one broker, one
+ * deadline and one error classification:
  *
  * - `searxBaseUrl()` / `timeoutMs()` read `Z1_SEARX_URL` (default
  *   `http://127.0.0.1:8888`) and `Z1_WEB_TIMEOUT_MS` (default 15000) once per
@@ -28,7 +29,7 @@
  */
 
 /** Matches the manifest version; also every tool's User-Agent suffix. */
-export const VERSION = '0.2.0'
+export const VERSION = '0.3.1'
 
 export const DEFAULT_SEARX_URL = 'http://127.0.0.1:8888'
 export const DEFAULT_TIMEOUT_MS = 15_000
@@ -152,7 +153,7 @@ export function toWebError(error) {
  * @param {{ net: { request: (req: object) => Promise<object> } }} ctx
  * @param {string} url
  * @param {{ headers?: Record<string, string>, timeout?: number }} [options]
- * @returns {Promise<{ status: number, headers: Record<string, string>, body: string, truncated: boolean, ms: number }>}
+ * @returns {Promise<{ status: number, headers: Record<string, string>, body: string, truncated: boolean, ms: number, url: string }>}
  */
 export async function requestText(ctx, url, options = {}) {
   if (ctx === null || typeof ctx !== 'object' || ctx.net === undefined || typeof ctx.net.request !== 'function') {
@@ -188,6 +189,10 @@ export async function requestText(ctx, url, options = {}) {
       body,
       truncated: response.truncated === true,
       ms: Date.now() - started,
+      // The host follows redirects itself, so the URL it actually landed on is
+      // the only correct base for relative links and the honest one to show.
+      // Older SDKs do not send it, and the requested URL is the fallback.
+      url: typeof response.url === 'string' && response.url !== '' ? response.url : url,
     }
   } catch (error) {
     throw toWebError(error)

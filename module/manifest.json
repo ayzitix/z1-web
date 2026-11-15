@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "id": "com.z1.web",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "title": "z1 web",
-  "description": "Web search via a local SearXNG backend, plus keyless Stack Exchange and GitHub issue search for z1 workers",
+  "description": "Web search via a local SearXNG backend, page fetch to readable text, plus keyless Stack Exchange and GitHub issue search for z1 workers",
   "author": "z1",
   "license": "MIT",
   "engines": {

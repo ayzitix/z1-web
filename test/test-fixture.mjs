@@ -61,9 +61,9 @@ async function errorOf(fn) {
 
 // --- schema ----------------------------------------------------------------
 const schemas = tool().list()
-check('four tools are listed', schemas.length === 4)
-check('names are web.search / stack.search / github.issues / web.status',
-  schemas.map((s) => s.name).join(',') === 'web.search,stack.search,github.issues,web.status')
+check('five tools are listed', schemas.length === 5)
+check('names are web.search / web.fetch / stack.search / github.issues / web.status',
+  schemas.map((s) => s.name).join(',') === 'web.search,web.fetch,stack.search,github.issues,web.status')
 check('search requires only query', JSON.stringify(schemas[0].parameters.required) === '["query"]')
 check('descriptions mention untrusted results', /untrusted/i.test(schemas[0].description))
 check('descriptions mention site: and recency', /site:/.test(schemas[0].description) && /recency/.test(schemas[0].description))
@@ -84,7 +84,7 @@ check('relative/javascript URLs dropped', !/relative|javascript:/.test(plain))
 check('www. is NOT stripped', plain.includes('https://www.example.com/'))
 check('SearXNG order preserved', plain.indexOf('nodejs.org/api/stream.html') < plain.indexOf('example.com/post'))
 check('request had Accept + User-Agent',
-  requests[0].headers.accept === 'application/json' && requests[0].headers['user-agent'] === 'z1-web/0.2.0')
+  requests[0].headers.accept === 'application/json' && requests[0].headers['user-agent'] === 'z1-web/0.3.1')
 check('request URL carries format=json and language=all',
   requests[0].url.includes('format=json') && requests[0].url.includes('language=all') && requests[0].url.includes('safesearch=0'))
 
@@ -243,7 +243,7 @@ for (const [args, expected] of validation) {
   check(`rejects ${JSON.stringify(args)}`, message.includes(expected), message)
 }
 check('rejects a non-object argument', (await errorOf(() => tool().call('web.search', 'x'))).includes('expects an object'))
-check('rejects an unknown tool', (await errorOf(() => tool().call('web.fetch', {}))).includes('unknown tool'))
+check('rejects an unknown tool', (await errorOf(() => tool().call('web.crawl', {}))).includes('unknown tool'))
 
 // --- status ----------------------------------------------------------------
 delete process.env.Z1_SEARX_STATE

@@ -1,8 +1,9 @@
 # z1-web
 
 Web search for the z1 agent: a native, loopback-only SearXNG instance plus the
-`com.z1.web` module that exposes `web.search` and `web.status`. No API keys, no
-vendor SDK, no Docker, nothing reachable from the LAN.
+`com.z1.web` module that exposes `web.search`, `web.fetch`, `web.status`,
+`stack.search` and `github.issues`. No API keys, no vendor SDK, no Docker,
+nothing reachable from the LAN.
 
 ## How the backend runs
 
@@ -29,7 +30,7 @@ it is HTML, `search.formats` in the deployed settings lost its `json` entry.
 
 ```bash
 z1 module propose ~/Projects/z1-web/module         # the module only, not the repo root
-z1 module approve com.z1.web@0.1.0
+z1 module approve com.z1.web@0.3.1
 # then, in a z1 session:
 /tools on web.search
 ```
@@ -65,7 +66,8 @@ host exactly.
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `web.search` | `query` (required, ≤500 chars), `count` 1–20 (default 8), `site` (hostname suffix, also sent as `site:`), `language` (BCP-47 or `all`), `recency` (`day`/`week`/`month`/`year`), `safe` (boolean) | Numbered results: `N. title — url`, an indented snippet of at most 300 chars, and a `(searxng · shown of total · ms)` footer. Empty searches return one explanatory line instead. |
-| `web.status` | none | Two lines: the SearXNG URL and `healthy`/`unhealthy` with a short reason, then whether `Z1_SEARX_URL` is overridden and that `web.fetch` does not exist yet. Pings `/healthz` with a 3 s cap and never throws. |
+| `web.fetch` | `url` (required, absolute http(s)), `offset` (1-based character offset, default 1), `maxChars` 1000–100000 (default 50000) | A `title — url` line, a `(content-type · N chars · showing a–b · ms · cached: no)` footer, then the page's readable text as blocks: headings, paragraphs, lists, quotes, tables and fenced code, or a plain-text/JSON body verbatim. A cut answer ends with `offset=N` to continue. |
+| `web.status` | none | Two lines: the SearXNG URL and `healthy`/`unhealthy` with a short reason, then whether `Z1_SEARX_URL` is overridden and that `stack.search`/`github.issues` are keyless and available without the backend. Pings `/healthz` with a 3 s cap and never throws. |
 
 Failures are one actionable line, never a stack trace: a refused connection
 names the URL, a non-200 carries the status and a 200-char body excerpt, and
@@ -94,8 +96,12 @@ deployed settings.
 - **10-minute in-memory cache**, at most 50 entries, LRU. Only successful
   answers are cached; a worker restart loses the cache.
 - **Results are untrusted text.** Titles and snippets are scraped upstream and
-  rendered inert, but they are still attacker-controlled content.
-- **`web.fetch` is not implemented yet.** `web.status` says so.
+  rendered inert, but they are still attacker-controlled content. A `web.fetch`
+  body is attacker-controlled too: HTML is reduced to inert blocks and the model
+  is told not to follow instructions found in a page.
+- **`web.fetch` refuses PDFs and binary bodies**, naming the type and size; there
+  is no JavaScript execution and no login, so a page rendered client-side comes
+  back nearly empty.
 
 ## Licence
 
