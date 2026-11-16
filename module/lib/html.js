@@ -29,7 +29,7 @@
  * @module z1-web/html
  */
 
-import { clip, oneLine, sanitise, TITLE_MAX } from './format.js'
+import { clip, oneLine, sanitise, stripFooterTail, TITLE_MAX } from './format.js'
 
 /**
  * How deep the tree may be, and how deep every walk over it may go. A real
@@ -57,6 +57,14 @@ const DROP = new Set([
   'button', 'nav', 'header', 'footer', 'aside', 'head', 'title', 'link',
   'meta', 'base',
 ])
+
+/**
+ * Chrome subtrees that are restored by the empty-region fallback. A page can
+ * legitimately put its whole body in `<form>` (a search or tracker result page)
+ * or `<header>` (a docs layout). The hard drops — scripts, styles, `<head>`,
+ * `<svg>` — stay out even then: their text is not prose.
+ */
+const SOFT_DROP = new Set(['form', 'header', 'footer', 'aside', 'nav', 'button'])
 
 /** Elements that start a new block even when they sit inside a paragraph. */
 const BLOCK = new Set([
@@ -405,7 +413,13 @@ function roleTokens(node) {
  */
 function isChrome(node, region, chrome = true) {
   if (node.type !== 'el') return false
-  if (DROP.has(node.name)) return true
+  if (DROP.has(node.name)) {
+    // The fallback re-reads a region whose text the filters emptied. Structural
+    // chrome (`<form>`, `<header>`, …) may then be the page's only content;
+    // script/style/head/svg text still never becomes prose.
+    if (chrome !== true && SOFT_DROP.has(node.name) && node !== region) return false
+    return true
+  }
   if (!chrome) return false
   if (node === region) return false
   const roles = roleTokens(node)
@@ -469,16 +483,44 @@ function renderInlineChildren(node, ctx, depth = depthOf(node)) {
 }
 
 /**
- * Text that will sit inside `[...]` or be an image's alt: one line, no
- * markdown link syntax (`](` would end the label and open a second link), no
+ * Percent-encode the characters that end a Markdown link destination. A page
+ * controls `href`, so a literal `)` in it would close the destination and let
+ * the rest — `[x](https://evil.example)` — become a second link in the model's
+ * view. `new URL` keeps `(` and `)` in a path, so this has to be explicit.
+ */
+const HREF_UNSAFE = /[()<>\[\]\\`|]/g
+
+export function escapeHref(href) {
+  return href.replace(HREF_UNSAFE, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`)
+}
+
+/**
+ * Text that will sit inside `[...]` or be an image's alt: one line, with the
+ * characters that end a label or open a second link backslash-escaped, and no
  * `javascript:` token. A page cannot smuggle a link, a footer or a second line
  * into the answer through its own link or alt text.
  */
 function inlineLabel(text) {
   return oneLine(text)
-    .replace(/\]\s*\(/g, '] (')
+    .replace(/([\\[\]()])/g, '\\$1')
     .replace(/javascript\s*:/gi, '')
     .trim()
+}
+
+/**
+ * Inline code is one code span, so it gets one backtick — not a fenced block
+ * that would swallow the rest of the paragraph. Only a backtick already inside
+ * the code lengthens the fence, and content that starts or ends with a
+ * backtick is padded, as CommonMark requires.
+ */
+function inlineCode(text) {
+  const inner = collapse(text)
+  if (inner === '') return ''
+  let longest = 0
+  for (const run of inner.match(/`+/g) ?? []) longest = Math.max(longest, run.length)
+  const fence = '`'.repeat(longest + 1)
+  const pad = inner.startsWith('`') || inner.endsWith('`') ? ' ' : ''
+  return `${fence}${pad}${inner}${pad}${fence}`
 }
 
 function renderInline(node, ctx, depth = depthOf(node)) {
@@ -488,18 +530,12 @@ function renderInline(node, ctx, depth = depthOf(node)) {
   if (isChrome(node, ctx.region, ctx.chrome !== false)) return ''
   if (node.name === 'br') return '\n'
   if (node.name === 'img') return node.attrs.alt ? inlineLabel(decodeEntities(node.attrs.alt)) : ''
-  if (node.name === 'code') {
-    const inner = collapse(rawText(node))
-    if (inner === '') return ''
-    const fence = fenceFor(inner)
-    const pad = fence.length > 1 ? ' ' : ''
-    return `${fence}${pad}${inner}${pad}${fence}`
-  }
+  if (node.name === 'code') return inlineCode(rawText(node))
   if (node.name === 'a') {
     const text = inlineLabel(renderInlineChildren(node, ctx, depth))
     if (text === '') return ''
     const href = absoluteUrl(node.attrs.href, ctx.base)
-    return href === undefined ? text : `[${text}](${href})`
+    return href === undefined ? text : `[${text}](${escapeHref(href)})`
   }
   return renderInlineChildren(node, ctx, depth)
 }
@@ -584,9 +620,9 @@ function renderList(node, ctx, depth = 0) {
 
 /**
  * `true` when a cell holds real block content (a paragraph, list, heading,
- * quote, nested table or code block). A table like that is page layout — the
- * GitHub issue layout, where the comment body lives in a `<td>` — and turning
- * it into pipe rows would flatten every paragraph and lose every code fence.
+ * quote, nested table or code block). Used to decide whether a generic
+ * container needs block rendering; for a table cell a `<p>` alone is not
+ * enough to call the table layout (see `isLayoutTable`).
  */
 function containsBlock(node, depth = depthOf(node)) {
   if (depth >= MAX_DEPTH) return false
@@ -601,47 +637,98 @@ function containsBlock(node, depth = depthOf(node)) {
   return false
 }
 
-function isLayoutTable(node, depth = depthOf(node)) {
+/**
+ * Elements that are only defensible as *layout* when they sit in a table cell.
+ * A `<p>` is not one: documentation and database listings routinely put each
+ * field in a paragraph inside a real data table.
+ */
+const TABLE_STRUCTURE = new Set(['pre', 'ul', 'ol', 'blockquote', 'table', 'dl', 'figure', 'fieldset', 'hr'])
+
+/** A heading, code block, list, nested table or span-merged cell: page layout. */
+function cellHasStructure(cell, depth = depthOf(cell)) {
   if (depth >= MAX_DEPTH) return false
-  for (const child of node.children) {
-    if (child.type !== 'el') continue
-    if (child.name === 'tr') {
-      for (const cell of child.children) {
-        if (cell.type === 'el' && (cell.name === 'td' || cell.name === 'th') && containsBlock(cell)) return true
-      }
-    } else if (child.name !== 'table' && isLayoutTable(child, depth + 1)) {
-      return true
+  if (cell.name === 'td' || cell.name === 'th') {
+    for (const key of ['colspan', 'rowspan']) {
+      const raw = cell.attrs?.[key]
+      if (typeof raw === 'string' && raw.trim() !== '' && raw.trim() !== '1') return true
     }
+  }
+  for (const child of cell.children ?? []) {
+    if (child.type !== 'el') continue
+    if (TABLE_STRUCTURE.has(child.name) || /^h[1-6]$/.test(child.name)) return true
+    if (cellHasStructure(child, depth + 1)) return true
   }
   return false
 }
 
-function renderTable(node, ctx, depth = depthOf(node)) {
+/** Rows directly belonging to this table, with their cells. */
+function tableRows(node, depth = depthOf(node)) {
+  const rows = []
+  if (depth >= MAX_DEPTH) return rows
+  for (const child of node.children) {
+    if (child.type !== 'el') continue
+    if (child.name === 'tr') {
+      rows.push(child.children.filter((cell) => cell.type === 'el' && (cell.name === 'td' || cell.name === 'th')))
+    } else if (child.name !== 'table') {
+      rows.push(...tableRows(child, depth + 1))
+    }
+  }
+  return rows
+}
+
+/**
+ * A table is layout when its shape says so: a cell carries a heading, code
+ * block, list, quote, nested table or `colspan`/`rowspan`; rows disagree about
+ * how many cells they have; or every row is a single cell (the GitHub issue
+ * wrapper, where the comment body is one `<td>`).
+ *
+ * A regular grid of cells whose content is just paragraphs is **data** and
+ * renders as pipe rows. Treating `<p>` as a layout signal flattened real tables
+ * into unrelated paragraphs.
+ */
+function isLayoutTable(node) {
+  const rows = tableRows(node)
+  if (rows.length === 0) return false
+  for (const cells of rows) {
+    if (cells.length === 0) continue
+    for (const cell of cells) {
+      if (cellHasStructure(cell)) return true
+    }
+  }
+  const widths = new Set(rows.map((cells) => cells.length))
+  if (widths.size > 1) return true
+  return rows.every((cells) => cells.length === 1)
+}
+
+function renderTable(node, ctx) {
   const rows = []
   let header = false
 
-  const walk = (element, at) => {
-    if (at >= MAX_DEPTH) return
-    for (const child of element.children) {
-      if (child.type !== 'el') continue
-      if (child.name === 'tr') {
-        const cells = child.children
-          .filter((cell) => cell.type === 'el' && (cell.name === 'td' || cell.name === 'th'))
-        if (cells.length === 0) continue
-        if (rows.length === 0 && cells.some((cell) => cell.name === 'th')) header = true
-        const values = cells.map((cell) => collapse(renderInlineChildren(cell, ctx)))
-        rows.push(`| ${values.join(' | ')} |`)
-        if (header && rows.length === 1) {
-          rows.push(`| ${values.map(() => '---').join(' | ')} |`)
-        }
-      } else if (child.name !== 'table') {
-        walk(child, at + 1)
-      }
-    }
+  for (const cells of tableRows(node)) {
+    if (cells.length === 0) continue
+    if (rows.length === 0 && cells.some((cell) => cell.name === 'th')) header = true
+    const values = cells.map((cell) => cellText(cell, ctx))
+    rows.push(`| ${values.join(' | ')} |`)
+    if (header && rows.length === 1) rows.push(`| ${values.map(() => '---').join(' | ')} |`)
   }
 
-  walk(node, depth)
   return rows.join('\n')
+}
+
+/**
+ * One cell as pipe-row content: inline pieces concatenated, block children
+ * separated by a space, and every literal `|` escaped so it cannot start a new
+ * column.
+ */
+function cellText(cell, ctx) {
+  let text = ''
+  for (const child of cell.children) {
+    const piece = child.type === 'el' && (BLOCK.has(child.name) || containsBlock(child))
+      ? ` ${renderInline(child, ctx)}`
+      : renderInline(child, ctx)
+    text += piece
+  }
+  return collapse(text).replace(/\|/g, '\\|')
 }
 
 /** Prefix every line of a block with `> `. */
@@ -811,22 +898,57 @@ function pageBase(root, baseUrl) {
 
 /**
  * The page title, safe to put on the answer's first line: one line, no control
- * characters, at most `TITLE_MAX` characters. A newline in `<title>` followed
- * by a parenthesised string used to render a second line that looked exactly
- * like the tool's own footer.
+ * characters, no footer-like tail, at most `TITLE_MAX` characters. A newline in
+ * `<title>` followed by a parenthesised string used to render a second line
+ * that looked exactly like the tool's own footer; `stripFooterTail` removes
+ * that shape and `titleLine` stops anything that survives from being read as a
+ * footer.
  */
 function documentTitle(root) {
-  const title = findElement(root, 'title')
+  const title = findTitle(root)
   if (title !== undefined) {
-    const text = clip(oneLine(rawText(title)), TITLE_MAX)
+    const text = clip(stripFooterTail(oneLine(rawText(title))), TITLE_MAX)
     if (text !== '') return text
   }
-  const h1 = findElement(root, 'h1')
+  const h1 = findVisible(root, 'h1')
   if (h1 !== undefined) {
-    const text = clip(oneLine(renderInlineChildren(h1, { base: undefined })), TITLE_MAX)
+    const text = clip(stripFooterTail(oneLine(renderInlineChildren(h1, { base: undefined }))), TITLE_MAX)
     if (text !== '') return text
   }
   return ''
+}
+
+/**
+ * `<title>` lives inside `<head>`, which is a hard drop, so the title search
+ * allows `head`/`title` and skips every other drop subtree. Without that, an
+ * inline `<svg><title>icon-name</title></svg>` at the top of `<body>` won the
+ * search and the page was titled `icon-name`.
+ */
+const TITLE_SKIP = new Set([...DROP].filter((name) => name !== 'head' && name !== 'title'))
+
+function findTitle(node, depth = depthOf(node)) {
+  if (depth > MAX_DEPTH) return undefined
+  for (const child of node.children ?? []) {
+    if (child.type !== 'el') continue
+    if (child.name === 'title') return child
+    if (TITLE_SKIP.has(child.name)) continue
+    const found = findTitle(child, depth + 1)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+/** Depth-first search for `name`, skipping every drop subtree. */
+function findVisible(node, name, depth = depthOf(node)) {
+  if (depth > MAX_DEPTH) return undefined
+  for (const child of node.children ?? []) {
+    if (child.type !== 'el') continue
+    if (child.name === name) return child
+    if (DROP.has(child.name)) continue
+    const found = findVisible(child, name, depth + 1)
+    if (found !== undefined) return found
+  }
+  return undefined
 }
 
 /** Depth-first search for the first element matching `predicate`. */

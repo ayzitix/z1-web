@@ -15,12 +15,16 @@
  * the request — a 422 costs one of the ten calls. GitHub caps a query at five
  * operators, so the tool never adds more than three.
  *
- * The qualifiers this tool owns — `repo:`, `state:`, `is:`, `user:`, `org:` and
- * `label:` — are **removed from the model's `query`** before the request. Left
- * in, they would arrive after ours (`repo:a/b boom repo:evil/x state:closed`)
- * and a repeated qualifier either widens the search or earns a 422. Stripping
- * is silent and documented: the arguments `repo`/`state`/`kind` are the way to
- * express those filters, so the words that remain are the user's keywords.
+ * The qualifiers this tool owns — `repo:`, `state:` and `is:` — are **removed
+ * from the model's `query`** before the request. Left in, they would arrive
+ * after ours (`repo:a/b boom repo:evil/x state:closed`) and a repeated
+ * qualifier either widens the search or earns a 422. Stripping is silent and
+ * documented: the arguments `repo`/`state`/`kind` are the way to express those
+ * filters, so the words that remain are the user's keywords. Everything else
+ * the model types is a *filter, not a keyword* to GitHub and is left exactly
+ * as written: `label:bug`, `user:torvalds`, `org:rust-lang`, `author:ghost`
+ * and `milestone:v1.0` have no argument equivalent, so removing them would
+ * silently widen the search to all of GitHub.
  *
  * `sort` is omitted for `relevance`: GitHub documents `created`, `updated` and
  * `comments` and treats anything else as best match, so sending the literal
@@ -49,11 +53,13 @@ const MAX_QUERY_LENGTH = 256
 const MAX_INPUT_QUERY = 500
 
 /**
- * A qualifier the tool owns, as it can appear in free text: at the start, after
- * whitespace or an opening bracket, optionally negated, with a bare or quoted
- * value. `repo:rust-lang/rust` and `state:"closed"` both go; so does `-is:pr`.
+ * The qualifier the tool owns, as it can appear in free text: at the start,
+ * after whitespace or an opening bracket, optionally negated, with a bare or
+ * quoted value. Only the three the arguments replace: `repo`, `state` and
+ * `is`. `label:`, `user:`, `org:`, `author:` and `milestone:` are the model's
+ * own filters and are passed through untouched.
  */
-const OWNED_QUALIFIER = /(?:^|[\s(])[-+]?(?:repo|state|is|user|org|label):(?:"[^"]*"|'[^']*'|\S+)/gi
+const OWNED_QUALIFIER = /(?:^|[\s(])[-+]?(?:repo|state|is):(?:"[^"]*"|'[^']*'|\S+)/gi
 
 const STATES = new Set(['open', 'closed', 'all'])
 const KINDS = new Set(['issue', 'pr', 'any'])

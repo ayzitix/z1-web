@@ -59,12 +59,14 @@ const TAG_PATTERN = /^[^\s;,&<>"']{1,35}$/
 
 const cache = createCache({ ttlMs: CACHE_TTL_MS, max: CACHE_MAX })
 
-/** Last quota we were told about, and any backoff we must wait out. */
+/** Last quota we were told about, any backoff we must wait out, and the daily reset. */
 const state = {
   remaining: undefined,
   max: undefined,
-  resetAt: undefined,
-  blockedUntil: 0,
+  /** Next 00:00 UTC, only when the payload says the daily quota is gone. */
+  quotaResetAt: undefined,
+  /** A short, server-requested pause from `backoff`/`Retry-After`. */
+  backoffUntil: 0,
 }
 
 /** Test seam: forget cached answers and quota state. */
@@ -72,8 +74,8 @@ export function clearCache() {
   cache.clear()
   state.remaining = undefined
   state.max = undefined
-  state.resetAt = undefined
-  state.blockedUntil = 0
+  state.quotaResetAt = undefined
+  state.backoffUntil = 0
 }
 
 /** Test/diagnostic seam: current cache occupancy. */
@@ -206,39 +208,45 @@ function resetText(at) {
   return `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC (in ${humanIn(at - Date.now())})`
 }
 
-/** Refuse locally while a backoff or an empty quota is outstanding. */
+/** Refuse locally while a backoff or an exhausted daily quota is outstanding. */
 function refuseEarly() {
   const now = Date.now()
-  if (now < state.blockedUntil) {
-    const wait = state.blockedUntil - now
+  if (now < state.backoffUntil) {
+    const wait = state.backoffUntil - now
     fail(
       `Stack Exchange asked to back off · retry in ${humanIn(wait)} ` +
-        `(${clockUtc(Math.ceil(state.blockedUntil / 1000))})`,
+        `(${clockUtc(Math.ceil(state.backoffUntil / 1000))})`,
     )
   }
-  if (state.remaining === 0 && state.resetAt !== undefined && now < state.resetAt) {
+  if (state.remaining === 0 && state.quotaResetAt !== undefined && now < state.quotaResetAt) {
     fail(
-      `Stack Exchange quota exhausted (resets ${resetText(state.resetAt)}) · ` +
+      `Stack Exchange quota exhausted (resets ${resetText(state.quotaResetAt)}) · ` +
         'the anonymous quota is 300 requests a day per IP',
     )
   }
 }
 
-/** Record whatever the payload says about quota and backoff. */
+/**
+ * Record whatever the payload says about quota and backoff. The two are
+ * different clocks: `backoff`/`Retry-After` is "wait this long before the next
+ * call" (seconds to hours), while the anonymous 300/day quota refills only at
+ * 00:00 UTC. A 429 with `Retry-After: 12345` therefore shortens nothing and
+ * must not be reported as a daily reset.
+ */
 function noteBudget(data, headers) {
   if (data !== null && typeof data === 'object') {
     const remaining = Number.isFinite(data.quota_remaining) ? Math.trunc(data.quota_remaining) : undefined
     const max = Number.isFinite(data.quota_max) ? Math.trunc(data.quota_max) : undefined
     if (remaining !== undefined) state.remaining = remaining
     if (max !== undefined) state.max = max
-    if (remaining === 0) state.resetAt = nextUtcMidnight()
+    if (remaining === 0) state.quotaResetAt = nextUtcMidnight()
     if (Number.isFinite(data.backoff) && data.backoff > 0) {
-      state.blockedUntil = Date.now() + Math.trunc(data.backoff) * 1000
+      state.backoffUntil = Math.max(state.backoffUntil, Date.now() + Math.trunc(data.backoff) * 1000)
     }
   }
   const retryAfter = headerInt(headers, 'retry-after')
   if (retryAfter !== undefined && retryAfter > 0) {
-    state.blockedUntil = Math.max(state.blockedUntil, Date.now() + retryAfter * 1000)
+    state.backoffUntil = Math.max(state.backoffUntil, Date.now() + retryAfter * 1000)
   }
 }
 
@@ -278,12 +286,24 @@ async function fetchStack(ctx, params) {
   const message = bodyMessage(response.body)
 
   if (response.status === 429) {
+    // `Retry-After` and `backoff` are already recorded by `noteBudget`. The
+    // message's own "in N seconds" is the same clock; the daily reset is a
+    // separate fact that only `quota_remaining: 0` may establish.
     const seconds = throttledSeconds(message)
-    if (seconds !== undefined) state.blockedUntil = Date.now() + seconds * 1000
-    const resetAt = state.blockedUntil > Date.now() ? state.blockedUntil : nextUtcMidnight()
-    state.resetAt = resetAt
-    state.remaining = 0
-    fail(`Stack Exchange quota exhausted (resets ${resetText(resetAt)}) · 300 requests a day per IP`)
+    if (seconds !== undefined) {
+      state.backoffUntil = Math.max(state.backoffUntil, Date.now() + seconds * 1000)
+    }
+    if (state.remaining === 0) {
+      state.quotaResetAt = nextUtcMidnight()
+      fail(`Stack Exchange quota exhausted (resets ${resetText(state.quotaResetAt)}) · 300 requests a day per IP`)
+    }
+    const wait = state.backoffUntil > Date.now()
+      ? `retry in ${humanIn(state.backoffUntil - Date.now())} (${clockUtc(Math.ceil(state.backoffUntil / 1000))})`
+      : 'retry in a minute'
+    fail(
+      `Stack Exchange rate-limited the request (HTTP 429) · ${wait} — ` +
+        'a temporary throttle, not the 300/day quota',
+    )
   }
   if (response.status === 400) {
     const site = unknownSiteFrom(message)

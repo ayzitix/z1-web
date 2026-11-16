@@ -40,6 +40,7 @@ import {
   redactUrl,
   requestText,
   searxBaseUrl,
+  searxCredentialError,
   timeoutMs,
   VERSION,
   WebError,
@@ -52,6 +53,10 @@ const CACHE_TTL_MS = 10 * 60 * 1000
 const CACHE_MAX = 50
 const DEFAULT_COUNT = 8
 const MAX_COUNT = 20
+/** SearXNG serves ten results per page regardless of the requested count. */
+export const PAGE_SIZE = 10
+/** One extra page is worth a request; more is a different search, not a count. */
+export const MAX_PAGES = 2
 const DEFAULT_LANGUAGE = 'all'
 const TIME_RANGES = new Set(['day', 'week', 'month', 'year'])
 
@@ -146,8 +151,10 @@ function readCount(value) {
 /**
  * The SearXNG request URL. `site:` is appended only when the query does not
  * already carry one (a model may pass both by hand) and never duplicated.
+ * `pageno` is only sent for page 2 and later, so the common request keeps the
+ * URL it always had.
  */
-export function searchUrl(params, base = searxBaseUrl()) {
+export function searchUrl(params, base = searxBaseUrl(), page = 1) {
   const url = new URL(`${base}/search`)
   const query = shouldAppendSite(params) ? `${params.query} site:${params.site}` : params.query
   url.searchParams.set('q', query)
@@ -155,6 +162,7 @@ export function searchUrl(params, base = searxBaseUrl()) {
   url.searchParams.set('language', params.language)
   url.searchParams.set('safesearch', params.safe ? '1' : '0')
   if (params.recency !== undefined) url.searchParams.set('time_range', params.recency)
+  if (page > 1) url.searchParams.set('pageno', String(page))
   return url.toString()
 }
 
@@ -163,9 +171,9 @@ function shouldAppendSite(params) {
   return !/\bsite:/i.test(params.query)
 }
 
-async function fetchJson(ctx, params) {
+async function fetchJson(ctx, params, page = 1) {
   const base = searxBaseUrl()
-  const url = searchUrl(params, base)
+  const url = searchUrl(params, base, page)
   const timeout = timeoutMs()
 
   let response
@@ -332,6 +340,23 @@ export function normaliseResults(raw, { count, site } = {}) {
   return { results, total: list.length }
 }
 
+/**
+ * Engine names SearXNG reported as failing. The payload is a list of
+ * `[name, reason]` pairs (older releases: plain names), and the names are
+ * upstream-controlled text, so they are flattened and clipped.
+ */
+export function normaliseEngines(raw) {
+  const list = Array.isArray(raw) ? raw : []
+  const names = []
+  for (const item of list) {
+    const name = Array.isArray(item) ? item[0] : typeof item === 'string' ? item : item?.name
+    if (typeof name !== 'string') continue
+    const clean = clip(oneLine(name), 40)
+    if (clean !== '' && !names.includes(clean)) names.push(clean)
+  }
+  return names
+}
+
 // ---------------------------------------------------------------------------
 // Cache
 // ---------------------------------------------------------------------------
@@ -354,6 +379,43 @@ function cacheKey(params, base) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/**
+ * Append one page's results to `out`, skipping URLs already seen on an earlier
+ * page (SearXNG pages overlap when engines disagree about order) and stopping
+ * at `count`. `seen` holds `dedupeKey` values and lives for the whole search.
+ */
+function collectPage(list, params, seen, out) {
+  const normalised = normaliseResults(list, { site: params.site })
+  for (const record of normalised.results) {
+    const url = cleanUrl(record.url)
+    const key = url === undefined ? record.url : dedupeKey(url)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(record)
+    if (out.length >= params.count) break
+  }
+}
+
+/**
+ * Record one page's fetchable URLs as seen and return how many were new. A
+ * result without an absolute `http(s)` URL is dropped by `normaliseResults` and
+ * can never be rendered, so it is not counted either: `of N` must not advertise
+ * hits the answer cannot contain.
+ */
+function freshCount(list, seen) {
+  let fresh = 0
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') continue
+    const url = cleanUrl(item.url)
+    if (url === undefined) continue
+    const key = dedupeKey(url)
+    if (seen.has(key)) continue
+    seen.add(key)
+    fresh += 1
+  }
+  return fresh
+}
+
 /** Run one search and return the model-facing text. Throws on failure. */
 export async function runSearch(ctx, raw) {
   const params = readParams(raw)
@@ -365,16 +427,46 @@ export async function runSearch(ctx, raw) {
     return renderAnswer(params, { ...cached, cached: true })
   }
 
-  const { data, ms } = await fetchJson(ctx, params)
-  const hasResults = Array.isArray(data.results)
-  const normalised = normaliseResults(hasResults ? data.results : [], params)
+  const first = await fetchJson(ctx, params, 1)
+  const seenKeys = new Set()
+  const countSeen = new Set()
+  const results = []
+  const unresponsive = normaliseEngines(first.data.unresponsive_engines)
+
+  const firstList = Array.isArray(first.data.results) ? first.data.results : []
+  collectPage(firstList, params, seenKeys, results)
+  // Page one's `total` is what SearXNG returned, before de-duplication and
+  // filtering, so `5 of 10` still says the answer is a slice of ten upstream
+  // hits. Its keys are only recorded, so page two can tell what is genuinely new.
+  let total = firstList.length
+  freshCount(firstList, countSeen)
+  let ms = first.ms
+  let pages = 1
+
+  // SearXNG serves ten results a page whatever `count` asks for. One extra page
+  // is worth a request when the model asked for more and page one came back
+  // full: a short page means there is nothing behind it.
+  if (params.count > PAGE_SIZE && firstList.length >= PAGE_SIZE && results.length < params.count) {
+    const second = await fetchJson(ctx, params, 2)
+    pages = 2
+    ms += second.ms
+    const secondList = Array.isArray(second.data.results) ? second.data.results : []
+    for (const name of normaliseEngines(second.data.unresponsive_engines)) {
+      if (!unresponsive.includes(name)) unresponsive.push(name)
+    }
+    collectPage(secondList, params, seenKeys, results)
+    total += freshCount(secondList, countSeen)
+  }
+
   const value = {
-    results: normalised.results,
-    total: normalised.total,
+    results,
+    total,
     ms,
+    pages,
+    unresponsive,
     // A missing `results` key is an answer (empty), so it is cached with its
     // note: every retry inside the TTL explains the same thing.
-    note: hasResults ? undefined : 'the JSON had no results key',
+    note: Array.isArray(first.data.results) ? undefined : 'the JSON had no results key',
   }
 
   cache.set(key, value)
@@ -383,13 +475,20 @@ export async function runSearch(ctx, raw) {
 
 function renderAnswer(params, answer) {
   const query = shouldAppendSite(params) ? `${params.query} site:${params.site}` : params.query
+  const unresponsive = answer.unresponsive ?? []
   if (answer.results.length === 0) {
-    return renderEmpty({ query, note: answer.note })
+    return renderEmpty({ query, note: answer.note, unresponsive })
   }
+  const pages = answer.pages ?? 1
   return renderResults({
     results: answer.results,
     total: Math.max(answer.total, answer.results.length),
     ms: answer.ms,
     cached: answer.cached,
+    pages,
+    // More was asked for than one page can hold, and paging did not happen:
+    // say why the list is short instead of implying the query had no more hits.
+    maxNote: params.count > PAGE_SIZE && pages === 1,
+    unresponsive,
   })
 }

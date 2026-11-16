@@ -35,7 +35,7 @@ An install is therefore two steps — get the repo, then propose its `module/`:
 ```bash
 git clone https://github.com/ayzitix/z1-web ~/Projects/z1-web
 z1 module propose ~/Projects/z1-web/module
-z1 module approve com.z1.web@0.3.2
+z1 module approve com.z1.web@0.3.3
 ```
 
 Then enable a tool in a z1 session:
@@ -60,15 +60,25 @@ and `web.search` fails with a refused connection naming
 `z1 module approve` shows this grant before accepting it:
 
 ```json
-{ "net": { "hosts": ["*", "127.0.0.1", "[::1]"] } }
+{ "net": { "hosts": ["*", "127.0.0.1:8888", "[::1]:8888"] } }
 ```
 
 - `*` is **public internet only** — a wildcard is not an SSRF grant. Loopback,
   LAN, link-local and cloud-metadata targets stay denied unless the manifest
   names that exact host.
-- `127.0.0.1` and `[::1]` are those explicit literals, and they exist solely so
-  the local SearXNG is reachable. There is no filesystem, process or LLM
-  capability in the manifest.
+- `127.0.0.1:8888` and `[::1]:8888` are **port-scoped**: host and port must both
+  match. A host-only `127.0.0.1` entry would grant every loopback port, so a
+  fetched page could reach an unrelated local service such as
+  `http://127.0.0.1:35545/admin`; the literal `host:port` grants SearXNG only
+  and no other loopback port.
+- The SDK's matcher must understand `host:port` (`checkNet` and
+  `checkNetTarget`, the latter after DNS resolution). On an older SDK the entry
+  does not match and SearXNG is unreachable — a visible failure, not a wider
+  grant.
+- `localhost` is not granted by name. With
+  `Z1_SEARX_URL=http://localhost:8888`, add `"localhost:8888"` (not
+  `"localhost"`, which would grant every localhost port). There is no
+  filesystem, process or LLM capability in the manifest.
 
 ## Layout
 
@@ -76,11 +86,17 @@ and `web.search` fails with a refused connection naming
 z1-web/
   module/        # installable module: manifest.json, index.js, lib/, assets/, README.md, LICENSE
     assets/      # searxng.settings.yml — the template the native backend is configured from
-  test/          # offline fixture harness: node test/test-fixture.mjs
+  test/          # offline harness: fake ctx.net + fixtures, no backend and no network
+    test-fixture.mjs     # 79 checks: five-tool contract, web.search, status
+    fetch-fixture.mjs    # 27 checks: web.fetch paging/cache/refusal, status fingerprints
+    html-fixture.mjs     # 42 checks: HTML extraction, forged titles, tables, links
+    stack-fixture.mjs    # 28 checks: stack.search, quota and backoff clocks
+    github-fixture.mjs   # 38 checks: github.issues, qualifiers, rate limit
 ```
 
-Propose `module/` only. The repository root holds the test fixtures and the
-licence, and `z1 module propose` copies the whole directory it is given.
+Propose `module/` only. The repository root holds the test harness and the
+licence, and `z1 module propose` copies the whole directory it is given. All
+five test files pass: **214 checks**.
 
 ## Configuration
 
@@ -89,17 +105,19 @@ licence, and `z1 module propose` copies the whole directory it is given.
 | `Z1_SEARX_URL` | `http://127.0.0.1:8888` | Overrides the SearXNG base URL the module talks to. Credentials are stripped before it is echoed anywhere. |
 
 The module talks to `http://127.0.0.1:8888` by default and `Z1_SEARX_URL`
-overrides it. Keep the IP form: a `localhost` URL needs `"localhost"` added to
-`capabilities.net.hosts` in the manifest, because grants match the normalised
-host exactly.
+overrides it. Keep the IP form: a `localhost` URL needs `"localhost:8888"`
+added to `capabilities.net.hosts` in the manifest, because grants match the
+normalised host **and** a port-scoped entry matches only that port.
 
 ## Tools
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `web.search` | `query` (required, ≤500 chars), `count` 1–20 (default 8), `site` (hostname suffix, also sent as `site:`), `language` (BCP-47 or `all`), `recency` (`day`/`week`/`month`/`year`), `safe` (boolean) | Numbered results: `N. title — url`, an indented snippet of at most 300 chars, and a `(searxng · shown of total · ms)` footer. Empty searches return one explanatory line instead. |
-| `web.fetch` | `url` (required, absolute http(s)), `offset` (1-based character offset, default 1), `maxChars` 1000–100000 (default 50000) | A `title — url` line, a `(content-type · N chars · showing a–b · ms · cached: no)` footer, then the page's readable text as blocks: headings, paragraphs, lists, quotes, tables and fenced code, or a plain-text/JSON body verbatim. A cut answer ends with `offset=N` to continue. |
-| `web.status` | none | Two lines: the SearXNG URL and `healthy`/`unhealthy` with a short reason, then whether `Z1_SEARX_URL` is overridden and that `stack.search`/`github.issues` are keyless and available without the backend. Pings `/healthz` with a 3 s cap and never throws. |
+| `web.search` | `query` (required, ≤500 chars), `count` 1–20 (default 8), `site` (hostname suffix, also sent as `site:`), `language` (BCP-47 or `all`), `recency` (`day`/`week`/`month`/`year`), `safe` (boolean) | Numbered results: `N. title — url`, an indented snippet of at most 300 chars, and a `(searxng · shown of total results · ms)` footer. SearXNG serves 10 results a page, so a `count` above 10 that fills page one costs a second request and the footer says `2 pages`; a short list that was the backend's page size says `max 10 per page` instead of pretending it is complete. |
+| `web.fetch` | `url` (required, absolute http(s)), `offset` (1-based character offset, default 1), `maxChars` 1000–100000 (default 50000) | A `title: TITLE — url` line (omitted when there is no title), a `(content-type · N chars · showing a–b · ms · cached: no)` footer, then the page's readable text as blocks: headings, paragraphs, lists, quotes, tables and fenced code, or a plain-text/JSON body verbatim. A cut answer ends with `offset=N` to continue. |
+| `stack.search` | `query` (required, ≤500 chars), `site` (slug, default `stackoverflow`), `tags` (at most 5), `accepted` (boolean), `sort`, `limit` 1–30 (default 8) | Numbered questions with `score · N answers · accepted · tags: … · date`, and a `(site · shown of total · quota left/max)` footer. |
+| `github.issues` | `query` (required, ≤500 chars), `repo` (`owner/name`), `state` (`open`/`closed`/`all`), `kind` (`issue`/`pr`/`any`), `sort`, `limit` 1–20 (default 8) | Numbered hits with `owner/repo · state · N comments · updated YYYY-MM-DD · #number`, and a `(github · shown of total · N/M requests left this minute)` footer. |
+| `web.status` | none | Two lines: the SearXNG URL and `healthy`/`unhealthy` with a short reason, then that `stack.search`/`github.issues` are keyless and available without the backend, plus a note when `Z1_SEARX_URL` is overridden. Pings `/healthz` with a 3 s cap and never throws. |
 
 Failures are one actionable line, never a stack trace: a refused connection
 names the URL, a non-200 carries the status and a 200-char body excerpt, and
@@ -146,9 +164,11 @@ deployed settings.
 - **Only a same-origin `<base href>` is honoured.** A page that points its base
   at another host keeps every link on the URL that was actually fetched, and the
   base is dropped.
-- **GitHub qualifiers typed into `query` are stripped.** `repo:`, `state:` and
-  `is:` in `github.issues`' `query` are removed, because the tool builds those
-  from its own arguments; use `repo`, `state` and `kind` instead.
+- **Only `repo:`, `state:` and `is:` are stripped from a GitHub `query`.** Those
+  three are built from the tool's own `repo`, `state` and `kind` arguments, so a
+  copy typed into `query` is removed; use the arguments instead. Every other
+  qualifier — `label:`, `user:`, `org:`, `author:`, `milestone:` — passes
+  through exactly as written.
 - **A `content-type` the body contradicts is sniffed and labelled.** Static hosts
   serve HTML as `text/plain` and some APIs answer JSON under `text/html`, so the
   footer reads `text/plain (sniffed html)` or `text/html (sniffed json)` and the

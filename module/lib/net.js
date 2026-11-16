@@ -29,9 +29,17 @@
  */
 
 /** Matches the manifest version; also every tool's User-Agent suffix. */
-export const VERSION = '0.3.2'
+export const VERSION = '0.3.3'
 
 export const DEFAULT_SEARX_URL = 'http://127.0.0.1:8888'
+/**
+ * The one loopback port the manifest grants. `capabilities.net.hosts` names
+ * `127.0.0.1:8888` and `[::1]:8888`, not the whole interface, so a page cannot
+ * be coaxed into reading an unrelated local service (`web.fetch
+ * http://127.0.0.1:35545/admin`). The SDK's host matcher must accept a
+ * `host:port` pattern for that grant to be enforceable; see the README.
+ */
+export const SEARX_PORT = 8888
 export const DEFAULT_TIMEOUT_MS = 15_000
 /** The host aborts its own fetch at 30 s; asking for more cannot succeed. */
 const MAX_TIMEOUT_MS = 30_000
@@ -47,6 +55,45 @@ export function searxBaseUrl() {
 /** `true` when the base URL came from the environment rather than the default. */
 export function searxBaseUrlIsOverride() {
   return (process.env['Z1_SEARX_URL'] ?? '').trim() !== ''
+}
+
+/**
+ * `user:pass@` in `Z1_SEARX_URL`, or `undefined`. A loopback SearXNG needs no
+ * authentication, and a base URL carrying credentials would be sent to the
+ * broker — and could end up in an error or a cache key. The caller refuses the
+ * call before any request instead of quietly redacting the display.
+ */
+export function searxCredentialError() {
+  const raw = (process.env['Z1_SEARX_URL'] ?? '').trim()
+  if (raw === '') return undefined
+  if (!urlHasCredentials(raw)) return undefined
+  return (
+    'Z1_SEARX_URL must not contain credentials (user:pass@); remove them — ' +
+    'a loopback SearXNG needs no authentication'
+  )
+}
+
+/** `true` when a URL carries a username or password. */
+export function urlHasCredentials(url) {
+  try {
+    const parsed = new URL(url)
+    return parsed.username !== '' || parsed.password !== ''
+  } catch {
+    return /\/\/[^/@\s]*@/.test(String(url))
+  }
+}
+
+/** `true` for an address that reaches this machine (127/8, ::1, localhost). */
+export function isLoopbackHostname(hostname) {
+  const host = String(hostname ?? '').trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
+  if (host === 'localhost' || host === '::1' || host === '0:0:0:0:0:0:0:1') return true
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+}
+
+/** The effective port of a parsed URL (`http` 80, `https` 443 when omitted). */
+export function urlPort(parsed) {
+  if (parsed.port !== '') return Number(parsed.port)
+  return parsed.protocol === 'https:' ? 443 : 80
 }
 
 /** The search deadline in milliseconds; out-of-range values fall back. */

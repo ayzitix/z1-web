@@ -59,6 +59,13 @@ async function errorOf(fn) {
   }
 }
 
+/**
+ * The searxng footer is the line that starts `(searxng · `, not necessarily the
+ * last line: a failed engine adds `(N engines unresponsive: …)` **after** it, on
+ * its own line, so a `$`-anchored regex against the whole text no longer holds.
+ */
+const footerOf = (text) => text.split('\n').find((line) => line.startsWith('(searxng · ')) ?? '(no footer)'
+
 // --- schema ----------------------------------------------------------------
 const schemas = tool().list()
 check('five tools are listed', schemas.length === 5)
@@ -75,7 +82,11 @@ requests = []
 nextResponse = null
 const plain = await call({ query: 'streams' })
 
-check('normalised count is 5 of 10 raw', /\(searxng · 5 of 10 results · \d+ ms\)$/.test(plain), plain.split('\n').at(-1))
+check('normalised count is 5 of 10 raw', /^\(searxng · 5 of 10 results · \d+ ms\)$/.test(footerOf(plain)), footerOf(plain))
+check('an unresponsive engine is its own line, after the footer',
+  plain.split('\n').at(-1) === '(1 engine unresponsive: google)', plain.split('\n').at(-1))
+check('the footer is not the last line when an engine failed',
+  footerOf(plain) !== plain.split('\n').at(-1))
 check('utm/fragment duplicate collapsed', (plain.match(/nodejs\.org\/api\/stream\.html/g) ?? []).length === 1)
 check('utm params stripped from the displayed URL', !/utm_source/.test(plain))
 check('trailing slash stripped from path', !/stream\.html\//.test(plain))
@@ -84,7 +95,8 @@ check('relative/javascript URLs dropped', !/relative|javascript:/.test(plain))
 check('www. is NOT stripped', plain.includes('https://www.example.com/'))
 check('SearXNG order preserved', plain.indexOf('nodejs.org/api/stream.html') < plain.indexOf('example.com/post'))
 check('request had Accept + User-Agent',
-  requests[0].headers.accept === 'application/json' && requests[0].headers['user-agent'] === 'z1-web/0.3.2')
+  requests[0].headers.accept === 'application/json' && requests[0].headers['user-agent'] === 'z1-web/0.3.3',
+  JSON.stringify(requests[0].headers))
 check('request URL carries format=json and language=all',
   requests[0].url.includes('format=json') && requests[0].url.includes('language=all') && requests[0].url.includes('safesearch=0'))
 
@@ -105,7 +117,7 @@ clearCache()
 requests = []
 const site = await call({ query: 'streams', site: 'nodejs.org' })
 check('site query is sent as site:', requests[0].url.includes('site%3Anodejs.org') || requests[0].url.includes('site:nodejs.org'), requests[0].url)
-check('site keeps only the host suffix', /\(searxng · 2 of 10 results/.test(site), site.split('\n').at(-1))
+check('site keeps only the host suffix', /^\(searxng · 2 of 10 results/.test(footerOf(site)), footerOf(site))
 check('site excludes www.example.com and evil.example', !/www\.example\.com|evil\.example/.test(site))
 check('site keeps a subdomain', site.includes('blog.nodejs.org'))
 
@@ -113,7 +125,7 @@ clearCache()
 requests = []
 const siteAgain = await call({ query: 'streams site:nodejs.org', site: 'nodejs.org' })
 check('site: is not appended twice', (requests[0].url.match(/site/i) ?? []).length === 1, requests[0].url)
-check('manual site: query still post-filtered', /2 of 10/.test(siteAgain), siteAgain.split('\n').at(-1))
+check('manual site: query still post-filtered', /2 of 10/.test(footerOf(siteAgain)), footerOf(siteAgain))
 check('hostMatches rejects a suffix that is not a host boundary', !cleanUrl('https://notnodejs.org/').hostname.endsWith('.nodejs.org'))
 check('hostMatches accepts a subdomain', 'docs.nodejs.org'.endsWith('.nodejs.org'))
 
@@ -121,7 +133,7 @@ check('hostMatches accepts a subdomain', 'docs.nodejs.org'.endsWith('.nodejs.org
 clearCache()
 requests = []
 const counted = await call({ query: 'streams', count: 2 })
-check('count clips to 2', /\(searxng · 2 of 10/.test(counted), counted.split('\n').at(-1))
+check('count clips to 2', /^\(searxng · 2 of 10/.test(footerOf(counted)), footerOf(counted))
 check('count does not change the query', requests[0].url.includes('q=streams&'))
 
 clearCache()
@@ -151,7 +163,7 @@ nextResponse = SEARCH
 const first = await call({ query: 'streams' })
 const second = await call({ query: 'streams' })
 check('second identical call is served from cache', requests.length === 1, `${requests.length} requests`)
-check('cached footer says cached', /· cached\)$/.test(second), second.split('\n').at(-1))
+check('cached footer says cached', / · cached\)$/.test(footerOf(second)), footerOf(second))
 check('cached answer is byte-identical apart from the footer', second.replace(' · cached)', ')') === first)
 
 await call({ query: 'streams', count: 4 })
@@ -166,7 +178,7 @@ check('oldest entry was evicted (re-fetched)', requests.length === beforeEvict +
 
 clock.now += 11 * 60 * 1000
 const afterTtl = await call({ query: 'capacity 0' })
-check('entries expire after 10 minutes', /· cached\)$/.test(afterTtl) === false, afterTtl.split('\n').at(-1))
+check('entries expire after 10 minutes', / · cached\)$/.test(footerOf(afterTtl)) === false, afterTtl.split('\n').at(-1))
 
 // --- errors ----------------------------------------------------------------
 clearCache()
@@ -260,10 +272,25 @@ check('status second line names both keyless tools and the quotas',
 
 nextResponse = () => ({ status: 500, headers: {}, body: 'boom', truncated: false })
 const unhealthy = await tool().call('web.status', {})
-check('status reports a non-200 as down without throwing',
-  unhealthy.split('\n')[0] === 'searxng · http://127.0.0.1:8888 · down · z1 starts it on launch (first run installs ~120 MB)',
-  unhealthy)
+check('status reports a non-200 as unhealthy with its reason, without throwing',
+  unhealthy.split('\n')[0] === 'searxng · http://127.0.0.1:8888 · unhealthy · HTTP 500',
+  unhealthy.split('\n')[0])
+check('status still names the keyless tools when the backend is unhealthy',
+  unhealthy.split('\n')[1].includes('keyless · available'), unhealthy)
 
+nextResponse = () => ({
+  status: 200,
+  headers: { 'content-type': 'text/html' },
+  body: '<html><body>not searxng</body></html>',
+  truncated: false,
+})
+const impostor = await tool().call('web.status', {})
+check('status calls a 200 that is not SearXNG unhealthy, not healthy',
+  impostor.split('\n')[0].startsWith('searxng · http://127.0.0.1:8888 · unhealthy · ') &&
+    /not SearXNG/.test(impostor.split('\n')[0]),
+  impostor.split('\n')[0])
+
+nextResponse = () => ({ status: 500, headers: {}, body: 'boom', truncated: false })
 process.env.Z1_SEARX_STATE = `starting:${Date.now()}`
 const starting = await tool().call('web.status', {})
 check('status believes a starting hint from the host',
@@ -271,15 +298,22 @@ check('status believes a starting hint from the host',
     'searxng · http://127.0.0.1:8888 · starting · z1 is installing or starting it (~120 MB on first run); retry in a few seconds',
   starting)
 process.env.Z1_SEARX_STATE = `starting:${Date.now() - 3 * 60 * 1000}`
-check('status ignores a stale starting hint',
-  (await tool().call('web.status', {})).split('\n')[0].includes(' · down · '))
-delete process.env.Z1_SEARX_STATE
-
+const staleUnhealthy = await tool().call('web.status', {})
+check('status ignores a stale starting hint (a broken backend stays unhealthy)',
+  staleUnhealthy.split('\n')[0] === 'searxng · http://127.0.0.1:8888 · unhealthy · HTTP 500',
+  staleUnhealthy.split('\n')[0])
 nextResponse = () => {
   throw new Error('fetch failed')
 }
+const staleDown = await tool().call('web.status', {})
+check('status ignores a stale starting hint (a dead backend is down)',
+  staleDown.split('\n')[0] ===
+    'searxng · http://127.0.0.1:8888 · down · connection refused · z1 starts it on launch (first run installs ~120 MB)',
+  staleDown.split('\n')[0])
+delete process.env.Z1_SEARX_STATE
+
 const dead = await tool().call('web.status', {})
-check('status never throws', dead.includes(' · down · '), dead)
+check('status never throws', dead.split('\n')[0].includes(' · down · '), dead)
 delete process.env.Z1_SEARX_URL
 
 console.log(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`} — ${checks} checks`)

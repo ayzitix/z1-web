@@ -39,9 +39,20 @@
  */
 
 import { cacheKey as makeKey, createCache } from './cache.js'
-import { clip, oneLine, TITLE_MAX } from './format.js'
+import { clip, oneLine, stripFooterTail, titleLine, TITLE_MAX } from './format.js'
 import { charCount, extractHtml, slicePoints } from './html.js'
-import { header, headerInt, redactUrl, requestText, timeoutMs, VERSION, WebError } from './net.js'
+import {
+  header,
+  headerInt,
+  isLoopbackHostname,
+  redactUrl,
+  requestText,
+  SEARX_PORT,
+  timeoutMs,
+  urlPort,
+  VERSION,
+  WebError,
+} from './net.js'
 
 /** The `Accept` we send: HTML first, everything else allowed, cheap. */
 export const ACCEPT = 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5'
@@ -134,6 +145,21 @@ export function readParams(raw) {
   if (parsed.username !== '' || parsed.password !== '') {
     fail('url must not contain credentials (user:pass@); remove them and use a public URL')
   }
+  // The manifest grants `127.0.0.1:8888` / `[::1]:8888`, not the loopback
+  // interface, so a page (or a model following one) cannot read an unrelated
+  // local service such as a dev server's `/admin`. The host enforces the grant;
+  // this local check makes the intent explicit and costs no request. It is not
+  // a substitute for the host: redirects are re-checked there.
+  if (isLoopbackHostname(parsed.hostname) && urlPort(parsed) !== SEARX_PORT) {
+    fail(
+      `loopback is granted only for the local SearXNG at 127.0.0.1:${SEARX_PORT} ` +
+        `(and [::1]:${SEARX_PORT}) · ${parsed.hostname}:${urlPort(parsed)} is not the backend`,
+    )
+  }
+  // A fragment is client-side only: it is never sent and cannot change the
+  // response. Dropping it here means `#section` and the bare URL share one
+  // cache entry instead of downloading and storing the same page twice.
+  parsed.hash = ''
 
   const offset = readInteger(raw['offset'], FIRST_OFFSET, FIRST_OFFSET, Number.MAX_SAFE_INTEGER, 'offset')
   const maxChars = readInteger(raw['maxChars'], DEFAULT_MAX_CHARS, MIN_MAX_CHARS, MAX_MAX_CHARS, 'maxChars')
@@ -284,7 +310,7 @@ export function renderAnswer({ url, contentType, title, text, total, offset, max
 
   const shown = total === 0 ? '' : slicePoints(text, offset - 1, maxChars)
   const lines = []
-  if (title !== '') lines.push(`${title} — ${url}`)
+  if (title !== '') lines.push(titleLine(title, url))
   lines.push(`(${parts.join(' · ')})`)
   lines.push('')
   lines.push(shown)
@@ -300,7 +326,7 @@ function pastEndAnswer({ url, contentType, title, total, offset, ms, cached, cap
   if (capped) parts.push('body capped at 1 MiB')
   const notice = `(offset ${offset} is past the end; this page has ${groupDigits(total)} chars — call web.fetch with offset=1)`
   const lines = []
-  if (title !== '') lines.push(`${title} — ${url}`)
+  if (title !== '') lines.push(titleLine(title, url))
   lines.push(`(${parts.join(' · ')})`)
   lines.push('')
   lines.push(notice)
@@ -406,7 +432,7 @@ async function loadPage(ctx, params) {
       const extracted = extractHtml(body, finalUrl)
       // The extractor already flattens and clips the title; doing it again here
       // is cheap and means no future title source can forge the footer line.
-      title = clip(oneLine(extracted.title), TITLE_MAX)
+      title = clip(stripFooterTail(oneLine(extracted.title)), TITLE_MAX)
       text = extracted.text
     } else if (kind === 'json') {
       text = prettyJson(body)

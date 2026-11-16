@@ -121,28 +121,80 @@ export function clockUtc(epoch) {
 
 
 /**
+ * A page can put anything in `<title>`, including a parenthesised tail built to
+ * look like this module's footer (`(text/html · 99 999 chars · …)`). Remove
+ * trailing parenthetical groups that carry a footer's tell-tales — a middle dot,
+ * `N chars`, or `cached:` — while leaving ordinary prose parentheses alone
+ * (`Writing (2024)` stays).
+ */
+const FOOTER_TAIL = /\s*\((?:[^()]*·[^()]*|[^()]*\b\d[\d ]*\s*chars\b[^()]*|[^()]*\bcached\s*:[^()]*)\)\s*$/
+
+export function stripFooterTail(text) {
+  let out = text.trim()
+  while (FOOTER_TAIL.test(out)) out = out.replace(FOOTER_TAIL, '').trim()
+  return out
+}
+
+/**
+ * The first line of a `web.fetch` answer. The `title: ` prefix means a title
+ * can never impersonate the footer line that follows it, which is a bare
+ * parenthetical: a page title containing `(text/html · …)` is plainly part of
+ * the title, not a second footer.
+ */
+export function titleLine(title, url) {
+  return `title: ${title} — ${url}`
+}
+
+/**
  * The whole result list plus its footer. `total` is how many results SearXNG
  * returned before de-duplication, `site` filtering and `count` clipping, so
  * the footer tells the model whether it is seeing a slice.
+ *
+ * `pages` is how many SearXNG result pages were requested (SearXNG serves ten
+ * per page). `maxNote` says `max 10 per page` when the model asked for more
+ * than a page and the backend could not fill it: the footer never pretends a
+ * short answer is the whole result set. `unresponsive` names engines SearXNG
+ * reported as failed, on its own line, because a thin answer without that line
+ * looks like a search that simply found nothing.
  */
-export function renderResults({ results, total, ms, cached = false }) {
+export function renderResults({ results, total, ms, cached = false, pages = 1, maxNote = false, unresponsive = [] }) {
   const body = results.map((result, index) => renderResult(result, index + 1)).join('\n')
-  const parts = ['searxng', `${results.length} of ${total} results`, `${ms} ms`]
+  const parts = ['searxng', `${results.length} of ${total} results`]
+  if (pages > 1) parts.push(`${pages} pages`)
+  parts.push(`${ms} ms`)
   if (cached) parts.push('cached')
-  const footer = `(${parts.join(' · ')})`
-  return body === '' ? footer : `${body}\n${footer}`
+  if (maxNote) parts.push('max 10 per page')
+  const lines = body === '' ? [] : [body]
+  lines.push(`(${parts.join(' · ')})`)
+  if (unresponsive.length > 0) lines.push(engineLine(unresponsive))
+  return lines.join('\n')
+}
+
+/** `(2 engines unresponsive: google, brave)` — its own line, clearly a fact. */
+export function engineLine(unresponsive) {
+  const count = unresponsive.length
+  return `(${count} ${count === 1 ? 'engine' : 'engines'} unresponsive: ${unresponsive.join(', ')})`
 }
 
 /**
  * The empty answer. It names the query, so the model can see what was actually
  * sent (including an appended `site:`), and it lists the three moves that
- * usually help instead of leaving the model to retry blindly.
+ * usually help instead of leaving the model to retry blindly. When SearXNG
+ * reported failed engines the line says so instead of implying a clean zero.
  */
-export function renderEmpty({ query, note }) {
+export function renderEmpty({ query, note, unresponsive = [] }) {
   const head = `(no results for ${JSON.stringify(query)}`
+  const notePart = note !== undefined && note !== '' ? `; ${note}` : ''
+  if (unresponsive.length > 0) {
+    const count = unresponsive.length
+    return (
+      `${head}${notePart} · ${count} ${count === 1 ? 'engine' : 'engines'} unresponsive: ` +
+      `${unresponsive.join(', ')} — likely rate-limited or blocked; retry later, ` +
+      'try shorter keywords, or fetch a known URL)'
+    )
+  }
   const hint = 'try shorter keywords, drop site:/recency, or fetch a known URL'
-  if (note !== undefined && note !== '') return `${head}; ${note} · ${hint})`
-  return `${head}; ${hint})`
+  return `${head}${notePart}; ${hint})`
 }
 
 // ---------------------------------------------------------------------------

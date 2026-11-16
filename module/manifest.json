@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "com.z1.web",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "title": "z1 web",
   "description": "Web search via a local SearXNG backend, page fetch to readable text, plus keyless Stack Exchange and GitHub issue search for z1 workers",
   "author": "z1",
@@ -20,7 +20,7 @@
   ],
   "capabilities": {
     "net": {
-      "hosts": ["*", "127.0.0.1", "[::1]"]
+      "hosts": ["*", "127.0.0.1:8888", "[::1]:8888"]
     }
   },
   "limits": {
